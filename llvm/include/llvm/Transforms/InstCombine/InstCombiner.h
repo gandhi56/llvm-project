@@ -446,17 +446,15 @@ public:
 
   /// Replace operand of instruction and add old operand to the worklist.
   Instruction *replaceOperand(Instruction &I, unsigned OpNum, Value *V) {
-    Value *OldOp = I.getOperand(OpNum);
+    Worklist.addValue(I.getOperand(OpNum));
     I.setOperand(OpNum, V);
-    Worklist.handleUseCountDecrement(OldOp);
     return &I;
   }
 
   /// Replace use and add the previously used value to the worklist.
   void replaceUse(Use &U, Value *NewValue) {
-    Value *OldOp = U;
+    Worklist.addValue(U);
     U = NewValue;
-    Worklist.handleUseCountDecrement(OldOp);
   }
 
   /// Combiner aware instruction erasure.
