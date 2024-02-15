@@ -14,12 +14,19 @@
 //===----------------------------------------------------------------------===//
 
 #include "llvm/LTO/LTOBackend.h"
+#include "llvm/ADT/ArrayRef.h"
+#include "llvm/ADT/STLExtras.h"
 #include "llvm/Analysis/AliasAnalysis.h"
 #include "llvm/Analysis/CGSCCPassManager.h"
+#include "llvm/Analysis/CallGraph.h"
+#include "llvm/Analysis/LazyCallGraph.h"
 #include "llvm/Analysis/ModuleSummaryAnalysis.h"
 #include "llvm/Analysis/TargetLibraryInfo.h"
 #include "llvm/Bitcode/BitcodeReader.h"
 #include "llvm/Bitcode/BitcodeWriter.h"
+#include "llvm/IR/CallingConv.h"
+#include "llvm/IR/Instructions.h"
+#include "llvm/IR/LLVMContext.h"
 #include "llvm/IR/LLVMRemarkStreamer.h"
 #include "llvm/IR/LegacyPassManager.h"
 #include "llvm/IR/PassManager.h"
@@ -30,11 +37,13 @@
 #include "llvm/Passes/PassBuilder.h"
 #include "llvm/Passes/PassPlugin.h"
 #include "llvm/Passes/StandardInstrumentations.h"
+#include "llvm/Support/AMDGPUAddrSpace.h"
 #include "llvm/Support/Error.h"
 #include "llvm/Support/FileSystem.h"
 #include "llvm/Support/MemoryBuffer.h"
 #include "llvm/Support/Path.h"
 #include "llvm/Support/Program.h"
+#include "llvm/Support/ScopedPrinter.h"
 #include "llvm/Support/ThreadPool.h"
 #include "llvm/Support/ToolOutputFile.h"
 #include "llvm/Support/VirtualFileSystem.h"
@@ -43,6 +52,7 @@
 #include "llvm/TargetParser/SubtargetFeature.h"
 #include "llvm/Transforms/IPO/WholeProgramDevirt.h"
 #include "llvm/Transforms/Scalar/LoopPassManager.h"
+#include "llvm/Transforms/Utils/Cloning.h"
 #include "llvm/Transforms/Utils/FunctionImportUtils.h"
 #include "llvm/Transforms/Utils/SplitModule.h"
 #include <optional>
@@ -503,6 +513,129 @@ Error lto::finalizeOptimizationRemarks(
   return Error::success();
 }
 
+void lto::cloneFunctionsWithGVs(Module &M) {
+  // Return the unique function that defines GV
+  auto GetFunctionDefiningGV = [](GlobalVariable &GV) -> Function * {
+    SmallVector<User *> Worklist(GV.users());
+    while (!Worklist.empty()) {
+      User *U = Worklist.pop_back_val();
+      if (auto *Inst = dyn_cast<Instruction>(U))
+        return Inst->getFunction();
+      if (auto *Op = dyn_cast<Operator>(U))
+        append_range(Worklist, Op->users());
+    }
+    llvm_unreachable("GV must be used in a function.");
+  };
+
+  // Replace all references to OldGV with NewGV, in NewF
+  auto ReplaceUsesOfWith = [](GlobalVariable *OldGV, 
+    GlobalVariable *NewGV, Function *NewF) -> bool {
+    bool Changed = false;
+
+    // Collect all instructions where OldGV needs a replacement
+    SmallVector<Instruction *> InstsToReplace;
+    for (auto *U : OldGV->users()) {
+      for (auto &Use : U->uses()) {
+        auto *Inst = cast<Instruction>(Use.getUser());
+        if (Inst->getFunction()->getName() == NewF->getName())
+          InstsToReplace.push_back(Inst);
+      }
+    }
+
+    // Replace OldGV uses with NewGV uses in the collected insts
+    for (auto *Inst : InstsToReplace) {
+      Value *V = NewGV;
+      auto *InstOpTy = Inst->getOperand(0)->getType();
+      if (InstOpTy != V->getType())
+        V = CastInst::CreatePointerBitCastOrAddrSpaceCast(V, InstOpTy, "", Inst);
+      Inst->setOperand(0, V);
+      Changed = true;
+    }
+    return Changed;
+  };
+
+  // For each function in the call graph, determine the number
+  // of ancestor-caller kernels.
+  CallGraph CG(M);
+  DenseMap<Function *, unsigned int> KernelRefsToFuncs;
+  for (auto &Fn : M) {
+    if (Fn.getCallingConv() != CallingConv::AMDGPU_KERNEL)
+      continue;
+
+    SmallVector<CallGraphNode *> CallGraphStack;
+    CallGraphStack.push_back(CG.getOrInsertFunction(&Fn));
+    while (!CallGraphStack.empty()) {
+      auto *CGN = CallGraphStack.pop_back_val();
+      KernelRefsToFuncs[CGN->getFunction()]++;
+      for (auto I = CGN->begin(); I != CGN->end(); ++I)
+        CallGraphStack.push_back(I->second);
+    }
+  }
+
+  // Loop over all LDS Global variables and collect the
+  // functions they are defined in
+  DenseMap<GlobalVariable *, Function *> GVToFnMap;
+  LLVMContext& Ctx = M.getContext();
+  IRBuilder<> IRB(Ctx);
+  for (auto &GV : M.globals()) {
+    if (GVToFnMap.contains(&GV) || GV.getType()->getPointerAddressSpace()
+      != AMDGPUAS::LOCAL_ADDRESS || !GV.hasInitializer())
+      continue;
+
+    auto *OldF = GetFunctionDefiningGV(GV);
+    GVToFnMap.insert({&GV, OldF});
+
+    // Collect all caller functions of OldF. Each of them must call each
+    // clone of OldF.
+    SmallVector<std::pair<Instruction *, SmallVector<Value *>>> InstsCallingOldF;
+    for (auto &I : OldF->uses()) {
+      User *U = I.getUser();
+      SmallVector<Value *> Args;
+      if (auto *CI = dyn_cast<CallInst>(U)) {
+        append_range(Args, CI->args());
+        InstsCallingOldF.push_back({CI, Args});
+      }
+      else if (auto *II = dyn_cast<InvokeInst>(U)) {
+        append_range(Args, II->args());
+        InstsCallingOldF.push_back({II, Args});
+      }
+    }
+
+    // Create as many clones of the function containing LDS global as
+    // there are kernels calling the function. Respectively, clone the
+    // LDS global and the call instructions to the function.
+    for (unsigned int I = 0; I+1 < KernelRefsToFuncs[OldF]; ++I) {
+      // Clone function
+      ValueToValueMapTy VMap;
+      auto *NewF = CloneFunction(OldF, VMap);
+      NewF->setName(OldF->getName() + ".clone." + to_string(I));
+      
+      // Clone LDS
+      auto *NewGV = new GlobalVariable(M, GV.getValueType(),
+        GV.isConstant(), GlobalValue::InternalLinkage,
+        UndefValue::get(GV.getValueType()),
+        GV.getName() + ".clone", nullptr,
+        GlobalValue::NotThreadLocal, AMDGPUAS::LOCAL_ADDRESS,
+        false);
+      NewGV->copyAttributesFrom(&GV);
+      NewGV->copyMetadata(&GV, 0);
+      NewGV->setComdat(GV.getComdat());
+      ReplaceUsesOfWith(&GV, NewGV, NewF);
+
+      // Create a new CallInst to call the cloned function
+      for (auto [Inst, Args] : InstsCallingOldF) {
+        IRB.SetInsertPoint(Inst);
+        if (isa<CallInst>(Inst))
+          IRB.CreateCall(NewF, Args, ".clone");
+        else if (auto *II = dyn_cast<InvokeInst>(Inst)) {
+          IRB.CreateInvoke(NewF, II->getNormalDest(),
+            II->getUnwindDest(), Args, ".clone");
+        }
+      }
+    }
+  }
+}
+
 Error lto::backend(const Config &C, AddStreamFn AddStream,
                    unsigned ParallelCodeGenParallelismLevel, Module &Mod,
                    ModuleSummaryIndex &CombinedIndex) {
@@ -513,6 +646,10 @@ Error lto::backend(const Config &C, AddStreamFn AddStream,
   std::unique_ptr<TargetMachine> TM = createTargetMachine(C, *TOrErr, Mod);
 
   LLVM_DEBUG(dbgs() << "Running regular LTO\n");
+
+  if (TM->getTargetTriple().isAMDGPU())
+    cloneFunctionsWithGVs(Mod);
+
   if (!C.CodeGenOnly) {
     if (!opt(C, TM.get(), 0, Mod, /*IsThinLTO=*/false,
              /*ExportSummary=*/&CombinedIndex, /*ImportSummary=*/nullptr,

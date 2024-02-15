@@ -39,6 +39,9 @@ bool opt(const Config &Conf, TargetMachine *TM, unsigned Task, Module &Mod,
          const ModuleSummaryIndex *ImportSummary,
          const std::vector<uint8_t> &CmdArgs);
 
+/// Clone functions with global variables on a combined module
+void cloneFunctionsWithGVs(Module &);
+
 /// Runs a regular LTO backend. The regular LTO backend can also act as the
 /// regular LTO phase of ThinLTO, which may need to access the combined index.
 Error backend(const Config &C, AddStreamFn AddStream,
