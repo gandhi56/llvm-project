@@ -20,6 +20,7 @@
 #include "AMDGPUIGroupLP.h"
 #include "AMDGPUMacroFusion.h"
 #include "AMDGPURegBankSelect.h"
+#include "AMDGPUSplitModule.h"
 #include "AMDGPUTargetObjectFile.h"
 #include "AMDGPUTargetTransformInfo.h"
 #include "AMDGPUUnifyDivergentExitNodes.h"
@@ -725,8 +726,9 @@ void AMDGPUTargetMachine::registerPassBuilderCallbacks(
         // We want to support the -lto-partitions=N option as "best effort".
         // For that, we need to lower LDS earlier in the pipeline before the
         // module is partitioned for codegen.
+        PM.addPass(AMDGPUCloneModuleLDSPass());
         if (EnableLowerModuleLDS)
-          PM.addPass(AMDGPULowerModuleLDSPass(*this));
+          PM.addPass(AMDGPULowerModuleLDSPass(*this, /*IsEarlyRun*/ true));
       });
 }
 
@@ -804,6 +806,13 @@ AMDGPUTargetMachine::getAddressSpaceForPseudoSourceKind(unsigned Kind) const {
     return AMDGPUAS::CONSTANT_ADDRESS;
   }
   return AMDGPUAS::FLAT_ADDRESS;
+}
+
+bool AMDGPUTargetMachine::ltoSplitModuleCustom(
+    Module &M, unsigned NumParts,
+    function_ref<void(std::unique_ptr<Module> MPart)> ModuleCallback) const {
+  splitAMDGPUModule(*this, M, NumParts, ModuleCallback);
+  return true;
 }
 
 //===----------------------------------------------------------------------===//

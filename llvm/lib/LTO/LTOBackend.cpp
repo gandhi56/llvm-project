@@ -470,9 +470,10 @@ static void splitCodeGen(const Config &C, TargetMachine *TM,
             std::move(BC), ThreadCount++);
       };
 
-  // Try target-specific module splitting first, then fallback to the default.
-  if (!TM->splitModule(Mod, ParallelCodeGenParallelismLevel,
-                       HandleModulePartition)) {
+  // Allow targets to try to split modules themselves using custom heuristics.
+  // Otherwise, fallback to generic splitting.
+  if (!TM->ltoSplitModuleCustom(Mod, ParallelCodeGenParallelismLevel,
+                                HandleModulePartition)) {
     SplitModule(Mod, ParallelCodeGenParallelismLevel, HandleModulePartition,
                 false);
   }

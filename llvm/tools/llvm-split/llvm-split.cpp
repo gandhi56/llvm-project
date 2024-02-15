@@ -6,8 +6,8 @@
 //
 //===----------------------------------------------------------------------===//
 //
-// This program can be used to test the llvm::SplitModule and
-// TargetMachine::splitModule functions.
+// This program can be used to test the llvm::SplitModule function and Target's
+// ltoSplitModuleCustom function.
 //
 //===----------------------------------------------------------------------===//
 
@@ -53,40 +53,42 @@ static cl::opt<bool>
                    cl::desc("Split without externalizing locals"),
                    cl::cat(SplitCategory));
 
-static cl::opt<std::string>
-    MTriple("mtriple",
-            cl::desc("Target triple. When present, a TargetMachine is created "
-                     "and TargetMachine::splitModule is used instead of the "
-                     "common SplitModule logic."),
-            cl::value_desc("triple"), cl::cat(SplitCategory));
+static cl::opt<std::string> MTarget(
+    "mtarget",
+    cl::desc("Target triple. When present, a TargetMachine is created "
+             "and its module splitting function is used instead of the default "
+             "SplitModule function."),
+    cl::value_desc("triple"), cl::cat(SplitCategory));
 
-static cl::opt<std::string>
-    MCPU("mcpu", cl::desc("Target CPU, ignored if -mtriple is not used"),
-         cl::value_desc("cpu"), cl::cat(SplitCategory));
+static cl::opt<std::string> MCPU("mcpu", cl::desc("Target CPU, needs -mtarget"),
+                                 cl::value_desc("cpu"), cl::cat(SplitCategory));
 
 int main(int argc, char **argv) {
   InitLLVM X(argc, argv);
+
+  // NOTE: If mtarget is not present we could avoid initializing targets to save
+  // time, but this is a testing tool and it's likely not worth the added
+  // complexity.
+  InitializeAllTargets();
+  InitializeAllTargetMCs();
 
   LLVMContext Context;
   SMDiagnostic Err;
   cl::HideUnrelatedOptions({&SplitCategory, &getColorCategory()});
   cl::ParseCommandLineOptions(argc, argv, "LLVM module splitter\n");
 
-  std::unique_ptr<TargetMachine> TM;
-  if (!MTriple.empty()) {
-    InitializeAllTargets();
-    InitializeAllTargetMCs();
-
+  TargetMachine *TM = nullptr;
+  if (!MTarget.empty()) {
     std::string Error;
-    const Target *T = TargetRegistry::lookupTarget(MTriple, Error);
+    const Target *T = TargetRegistry::lookupTarget(MTarget, Error);
     if (!T) {
-      errs() << "unknown target '" << MTriple << "': " << Error << "\n";
+      errs() << "unknown target '" << MTarget << "': " << Error << "\n";
       return 1;
     }
 
     TargetOptions Options;
-    TM = std::unique_ptr<TargetMachine>(T->createTargetMachine(
-        MTriple, MCPU, /*FS*/ "", Options, std::nullopt, std::nullopt));
+    TM = T->createTargetMachine(MTarget, MCPU, /*FS*/ "", Options, std::nullopt,
+                                std::nullopt);
   }
 
   std::unique_ptr<Module> M = parseIRFile(InputFilename, Err, Context);
@@ -117,13 +119,29 @@ int main(int argc, char **argv) {
     Out->keep();
   };
 
+  if (!TM) {
+    SplitModule(*M, NumOutputs, HandleModulePart, PreserveLocals);
+    return 0;
+  }
+
+  if (PreserveLocals) {
+    errs() << "warning: -preserve-locals has no effect when using the "
+              "target's custom module splitting\n";
+  }
+
+  if (!TM->ltoSplitModuleCustom(*M, NumOutputs, HandleModulePart)) {
+    errs() << "error: '" << MTarget
+           << "' does not implement custom module splitting\n";
+    return 1;
+  }
+
   if (TM) {
     if (PreserveLocals) {
       errs() << "warning: -preserve-locals has no effect when using "
                 "TargetMachine::splitModule\n";
     }
 
-    if (TM->splitModule(*M, NumOutputs, HandleModulePart))
+    if (TM->ltoSplitModuleCustom(*M, NumOutputs, HandleModulePart))
       return 0;
 
     errs() << "warning: "
