@@ -33,6 +33,7 @@
 #include "llvm/Support/ArrayRecycler.h"
 #include "llvm/Support/AtomicOrdering.h"
 #include "llvm/Support/Compiler.h"
+#include "llvm/Support/MD5.h"
 #include "llvm/Support/Recycler.h"
 #include "llvm/Target/TargetOptions.h"
 #include <bitset>
