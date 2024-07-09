@@ -2038,6 +2038,9 @@ X86TargetLowering::LowerCall(TargetLowering::CallLoweringInfo &CLI,
   if (CallingConv::X86_VectorCall == CallConv) {
     CCInfo.AnalyzeArgumentsSecondPass(Outs, CC_X86);
   }
+  // Set type id for call site info.
+  if (MF.getTarget().Options.EmitCallGraphSection && CB && CB->isIndirectCall())
+    CSInfo = MachineFunction::CallSiteInfo(*CB);
 
   bool IsMustTail = CLI.CB && CLI.CB->isMustTailCall();
   if (Subtarget.isPICStyleGOT() && !IsGuaranteeTCO && !IsMustTail) {

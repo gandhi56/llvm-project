@@ -331,6 +331,9 @@ namespace llvm {
     /// to selectively generate basic block sections.
     std::shared_ptr<MemoryBuffer> BBSectionsFuncListBuf;
 
+    /// Emit section containing call graph metadata.
+    unsigned EmitCallGraphSection : 1;
+
     /// The flag enables call site info production. It is used only for debug
     /// info, and it is restricted only to optimized code. This can be used for
     /// something else, so that should be controlled in the frontend.
