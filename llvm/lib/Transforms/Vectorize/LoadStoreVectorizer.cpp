@@ -394,7 +394,9 @@ bool LoadStoreVectorizerLegacyPass::runOnFunction(Function &F) {
   AssumptionCache &AC =
       getAnalysis<AssumptionCacheTracker>().getAssumptionCache(F);
 
-  return Vectorizer(F, AA, AC, DT, SE, TTI).run();
+  bool Changed = Vectorizer(F, AA, AC, DT, SE, TTI).run();
+  dbgs() << "Changed = " << Changed << "\n";
+  return Changed;
 }
 
 PreservedAnalyses LoadStoreVectorizerPass::run(Function &F,
@@ -416,6 +418,7 @@ PreservedAnalyses LoadStoreVectorizerPass::run(Function &F,
 }
 
 bool Vectorizer::run() {
+  dbgs() << "LSV: Running on function " << F.getName() << "\n";
   bool Changed = false;
   // Break up the BB if there are any instrs which aren't guaranteed to transfer
   // execution to their successor.
@@ -481,26 +484,26 @@ bool Vectorizer::runOnEquivalenceClass(const EqClassKey &EqClassKey,
                                        ArrayRef<Instruction *> EqClass) {
   bool Changed = false;
 
-  LLVM_DEBUG({
+  {
     dbgs() << "LSV: Running on equivalence class of size " << EqClass.size()
            << " keyed on " << EqClassKey << ":\n";
     for (Instruction *I : EqClass)
       dbgs() << "  " << *I << "\n";
-  });
+  };
 
   std::vector<Chain> Chains = gatherChains(EqClass);
-  LLVM_DEBUG(dbgs() << "LSV: Got " << Chains.size()
-                    << " nontrivial chains.\n";);
+  dbgs() << "LSV: Got " << Chains.size()
+                    << " nontrivial chains.\n";
   for (Chain &C : Chains)
     Changed |= runOnChain(C);
   return Changed;
 }
 
 bool Vectorizer::runOnChain(Chain &C) {
-  LLVM_DEBUG({
+  {
     dbgs() << "LSV: Running on chain with " << C.size() << " instructions:\n";
     dumpChain(C);
-  });
+  };
 
   // Split up the chain into increasingly smaller chains, until we can finally
   // vectorize the chains.
@@ -852,10 +855,10 @@ bool Vectorizer::vectorizeChain(Chain &C) {
 
   sortChainInOffsetOrder(C);
 
-  LLVM_DEBUG({
+  {
     dbgs() << "LSV: Vectorizing chain of " << C.size() << " instructions:\n";
     dumpChain(C);
-  });
+  };
 
   Type *VecElemTy = getChainElemTy(C);
   bool IsLoadChain = isa<LoadInst>(C[0].Inst);
@@ -901,6 +904,7 @@ bool Vectorizer::vectorizeChain(Chain &C) {
     VecInst = Builder.CreateAlignedLoad(VecTy,
                                         getLoadStorePointerOperand(C[0].Inst),
                                         Alignment);
+    dbgs() << "VecInst = " << *VecInst << "\n";
 
     unsigned VecIdx = 0;
     for (const ChainElem &E : C) {
@@ -1323,32 +1327,46 @@ Vectorizer::collectEquivalenceClasses(BasicBlock::iterator Begin,
   for (Instruction &I : make_range(Begin, End)) {
     auto *LI = dyn_cast<LoadInst>(&I);
     auto *SI = dyn_cast<StoreInst>(&I);
-    if (!LI && !SI)
+    if (!LI && !SI) {
+      dbgs() << "LSV: Skipping " << I << " because it's not a load or store\n";
       continue;
+    }
 
-    if ((LI && !LI->isSimple()) || (SI && !SI->isSimple()))
+    if ((LI && !LI->isSimple()) || (SI && !SI->isSimple())) {
+      dbgs() << "LSV: Skipping " << I << " because it's not a simple load/store\n";
       continue;
+    }
 
     if ((LI && !TTI.isLegalToVectorizeLoad(LI)) ||
-        (SI && !TTI.isLegalToVectorizeStore(SI)))
+        (SI && !TTI.isLegalToVectorizeStore(SI))) {
+      dbgs() << "LSV: Skipping " << I << " because it's not legal to vectorize "
+             << (LI ? "load" : "store") << "\n";
       continue;
+    }
 
     Type *Ty = getLoadStoreType(&I);
-    if (!VectorType::isValidElementType(Ty->getScalarType()))
+    if (!VectorType::isValidElementType(Ty->getScalarType())) {
+      dbgs() << "LSV: Skipping " << I << " because it has an invalid type\n";
       continue;
+    }
 
     // Skip weird non-byte sizes. They probably aren't worth the effort of
     // handling correctly.
     unsigned TySize = DL.getTypeSizeInBits(Ty);
-    if ((TySize % 8) != 0)
+    if ((TySize % 8) != 0) {
+      dbgs() << "LSV: Skipping " << I << " because it has a non-byte size\n";
       continue;
+    }
 
     // Skip vectors of pointers. The vectorizeLoadChain/vectorizeStoreChain
     // functions are currently using an integer type for the vectorized
     // load/store, and does not support casting between the integer type and a
     // vector of pointers (e.g. i64 to <2 x i16*>)
-    if (Ty->isVectorTy() && Ty->isPtrOrPtrVectorTy())
+    if (Ty->isVectorTy() && Ty->isPtrOrPtrVectorTy()) {
+      dbgs() << "LSV: Skipping " << I
+             << " because it has a vector of pointers type\n";
       continue;
+    }
 
     Value *Ptr = getLoadStorePointerOperand(&I);
     unsigned AS = Ptr->getType()->getPointerAddressSpace();
@@ -1359,18 +1377,31 @@ Vectorizer::collectEquivalenceClasses(BasicBlock::iterator Begin,
 
     // Only handle power-of-two sized elements.
     if ((!VecTy && !isPowerOf2_32(DL.getTypeSizeInBits(Ty))) ||
-        (VecTy && !isPowerOf2_32(DL.getTypeSizeInBits(VecTy->getScalarType()))))
+        (VecTy && !isPowerOf2_32(DL.getTypeSizeInBits(VecTy->getScalarType())))) {
+      dbgs() << "LSV: Skipping " << I << " because it has a non-power-of-2 "
+             << "sized element\n";
       continue;
+    }
 
     // No point in looking at these if they're too big to vectorize.
     if (TySize > VecRegSize / 2 ||
-        (VecTy && TTI.getLoadVectorFactor(VF, TySize, TySize / 8, VecTy) == 0))
+        (VecTy && TTI.getLoadVectorFactor(VF, TySize, TySize / 8, VecTy) == 0)) {
+      dbgs() << "LSV: Skipping " << I << " because it's too large to vectorize\n";
       continue;
+    }
 
+    dbgs() << "LSV: Considering " << I << "\n";
     Ret[{getUnderlyingObject(Ptr), AS,
          DL.getTypeSizeInBits(getLoadStoreType(&I)->getScalarType()),
          /*IsLoad=*/LI != nullptr}]
         .push_back(&I);
+  }
+
+  dbgs() << "Ret size: " << Ret.size() << "\n";
+  for (auto &KV : Ret) {
+    dbgs() << "Key: " << KV.first << "\n";
+    for (Instruction *I : KV.second)
+      dbgs() << "> " << *I << "\n";
   }
 
   return Ret;
