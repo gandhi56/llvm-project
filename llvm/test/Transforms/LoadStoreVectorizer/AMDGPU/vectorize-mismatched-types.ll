@@ -7,9 +7,11 @@ target triple = "amdgcn-amd-amdhsa"
 define amdgpu_kernel void @mixed_types_0(ptr addrspace(4) %kernarg.segment) {
 ; CHECK-LABEL: define amdgpu_kernel void @mixed_types_0(
 ; CHECK-SAME: ptr addrspace(4) [[KERNARG_SEGMENT:%.*]]) {
-; CHECK-NEXT:    [[PTR:%.*]] = load ptr addrspace(3), ptr addrspace(4) [[KERNARG_SEGMENT]], align 16
-; CHECK-NEXT:    [[DATA_AS_INT_KERNARG_OFFSET:%.*]] = getelementptr inbounds i8, ptr addrspace(4) [[KERNARG_SEGMENT]], i64 4
-; CHECK-NEXT:    [[DATA:%.*]] = load <2 x half>, ptr addrspace(4) [[DATA_AS_INT_KERNARG_OFFSET]], align 4
+; CHECK-NEXT:    [[TMP1:%.*]] = load <2 x i32>, ptr addrspace(4) [[KERNARG_SEGMENT]], align 16
+; CHECK-NEXT:    [[TMP2:%.*]] = extractelement <2 x i32> [[TMP1]], i32 0
+; CHECK-NEXT:    [[PTR:%.*]] = inttoptr i32 [[TMP2]] to ptr addrspace(3)
+; CHECK-NEXT:    [[TMP4:%.*]] = extractelement <2 x i32> [[TMP1]], i32 1
+; CHECK-NEXT:    [[DATA:%.*]] = bitcast i32 [[TMP4]] to <2 x half>
 ; CHECK-NEXT:    [[I1:%.*]] = atomicrmw fadd ptr addrspace(3) [[PTR]], <2 x half> [[DATA]] syncscope("agent") seq_cst, align 4
 ; CHECK-NEXT:    ret void
 ;

@@ -645,29 +645,28 @@ std::vector<Chain> Vectorizer::splitChainByContiguity(Chain &C) {
 
 Type *Vectorizer::getChainElemTy(const Chain &C) {
   assert(!C.empty());
-  // The rules are:
-  //  - If there are any pointer types in the chain, use an integer type.
-  //  - Prefer an integer type if it appears in the chain.
-  //  - Otherwise, use the first type in the chain.
-  //
-  // The rule about pointer types is a simplification when we merge e.g.  a load
-  // of a ptr and a double.  There's no direct conversion from a ptr to a
-  // double; it requires a ptrtoint followed by a bitcast.
-  //
-  // It's unclear to me if the other rules have any practical effect, but we do
-  // it to match this pass's previous behavior.
-  if (any_of(C, [](const ChainElem &E) {
-        return getLoadStoreType(E.Inst)->getScalarType()->isPointerTy();
-      })) {
-    return Type::getIntNTy(
-        F.getContext(),
-        DL.getTypeSizeInBits(getLoadStoreType(C[0].Inst)->getScalarType()));
+  auto &Ctx = C[0].Inst->getContext();
+  auto *ChainElemTy = getLoadStoreType(C[0].Inst);
+
+  // If all chain elements have the same type, return that type.
+  // Treat pointer type as an integer type.
+  if (all_of(C, [](ChainElem E) {
+        return getLoadStoreType(E.Inst)->isIntOrPtrTy();
+      }))
+    return ChainElemTy;
+
+  for (auto *Ty :
+       {Type::getHalfTy(Ctx), Type::getFloatTy(Ctx), Type::getDoubleTy(Ctx)}) {
+    if (all_of(C,
+               [&Ty](ChainElem E) { return getLoadStoreType(E.Inst) == Ty; })) {
+      return ChainElemTy;
+    }
   }
 
-  for (const ChainElem &E : C)
-    if (Type *T = getLoadStoreType(E.Inst)->getScalarType(); T->isIntegerTy())
-      return T;
-  return getLoadStoreType(C[0].Inst)->getScalarType();
+  // When types are mismatched, return the integer type
+  // with bitwidth of the chain elements.
+  unsigned N = DL.getTypeSizeInBits(ChainElemTy);
+  return IntegerType::getIntNTy(Ctx, N);
 }
 
 std::vector<Chain> Vectorizer::splitChainByAlignment(Chain &C) {
@@ -864,16 +863,9 @@ bool Vectorizer::vectorizeChain(Chain &C) {
   Type *VecElemTy = getChainElemTy(C);
   bool IsLoadChain = isa<LoadInst>(C[0].Inst);
   unsigned AS = getLoadStoreAddressSpace(C[0].Inst);
-  unsigned ChainBytes = std::accumulate(
-      C.begin(), C.end(), 0u, [&](unsigned Bytes, const ChainElem &E) {
-        return Bytes + DL.getTypeStoreSize(getLoadStoreType(E.Inst));
-      });
-  assert(ChainBytes % DL.getTypeStoreSize(VecElemTy) == 0);
   // VecTy is a power of 2 and 1 byte at smallest, but VecElemTy may be smaller
   // than 1 byte (e.g. VecTy == <32 x i1>).
-  Type *VecTy = FixedVectorType::get(
-      VecElemTy, 8 * ChainBytes / DL.getTypeSizeInBits(VecElemTy));
-
+  Type *VecTy = FixedVectorType::get(VecElemTy, C.size());
   Align Alignment = getLoadStoreAlignment(C[0].Inst);
   // If this is a load/store of an alloca, we might have upgraded the alloca's
   // alignment earlier.  Get the new alignment.
@@ -887,8 +879,9 @@ bool Vectorizer::vectorizeChain(Chain &C) {
   // All elements of the chain must have the same scalar-type size.
 #ifndef NDEBUG
   for (const ChainElem &E : C)
-    assert(DL.getTypeStoreSize(getLoadStoreType(E.Inst)->getScalarType()) ==
-           DL.getTypeStoreSize(VecElemTy));
+    assert("Elements do not have the same type size" &&
+           DL.getTypeStoreSize(getLoadStoreType(E.Inst)) ==
+               DL.getTypeStoreSize(VecElemTy));
 #endif
 
   Instruction *VecInst;
@@ -908,22 +901,12 @@ bool Vectorizer::vectorizeChain(Chain &C) {
 
     unsigned VecIdx = 0;
     for (const ChainElem &E : C) {
-      Instruction *I = E.Inst;
-      Value *V;
-      Type *T = getLoadStoreType(I);
-      if (auto *VT = dyn_cast<FixedVectorType>(T)) {
-        auto Mask = llvm::to_vector<8>(
-            llvm::seq<int>(VecIdx, VecIdx + VT->getNumElements()));
-        V = Builder.CreateShuffleVector(VecInst, Mask, I->getName());
-        VecIdx += VT->getNumElements();
-      } else {
-        V = Builder.CreateExtractElement(VecInst, Builder.getInt32(VecIdx),
-                                         I->getName());
-        ++VecIdx;
-      }
-      if (V->getType() != I->getType())
-        V = Builder.CreateBitOrPointerCast(V, I->getType());
-      I->replaceAllUsesWith(V);
+      // Extract element of type VecElemTy
+      Value *V =
+          Builder.CreateExtractElement(VecInst, Builder.getInt32(VecIdx++));
+      if (V->getType() != E.Inst->getType())
+        V = Builder.CreateBitOrPointerCast(V, E.Inst->getType());
+      E.Inst->replaceAllUsesWith(V);
     }
 
     // Finally, we need to reorder the instrs in the BB so that the (transitive)
@@ -960,18 +943,8 @@ bool Vectorizer::vectorizeChain(Chain &C) {
         V = Builder.CreateBitOrPointerCast(V, VecElemTy);
       Vec = Builder.CreateInsertElement(Vec, V, Builder.getInt32(VecIdx++));
     };
-    for (const ChainElem &E : C) {
-      auto *I = cast<StoreInst>(E.Inst);
-      if (FixedVectorType *VT =
-              dyn_cast<FixedVectorType>(getLoadStoreType(I))) {
-        for (int J = 0, JE = VT->getNumElements(); J < JE; ++J) {
-          InsertElem(Builder.CreateExtractElement(I->getValueOperand(),
-                                                  Builder.getInt32(J)));
-        }
-      } else {
-        InsertElem(I->getValueOperand());
-      }
-    }
+    for (const ChainElem &E : C)
+      InsertElem(cast<StoreInst>(E.Inst)->getValueOperand());
 
     // Chain is in offset order, so C[0] is the instr with the lowest offset,
     // i.e. the root of the vector.
@@ -1372,7 +1345,7 @@ Vectorizer::collectEquivalenceClasses(BasicBlock::iterator Begin,
       continue;
 
     Ret[{GetUnderlyingObject(Ptr), AS,
-         DL.getTypeSizeInBits(getLoadStoreType(&I)->getScalarType()),
+         DL.getTypeSizeInBits(getLoadStoreType(&I)),
          /*IsLoad=*/LI != nullptr}]
         .emplace_back(&I);
   }

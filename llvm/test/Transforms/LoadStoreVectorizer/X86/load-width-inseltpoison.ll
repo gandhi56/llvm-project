@@ -7,10 +7,10 @@ define <8 x double> @loadwidth_insert_extract(ptr %ptr) {
     %b = getelementptr <2 x double>, ptr %ptr, i32 1
     %c = getelementptr <2 x double>, ptr %ptr, i32 2
     %d = getelementptr <2 x double>, ptr %ptr, i32 3
-; CHECK-HSW: load <4 x double>
-; CHECK-HSW: load <4 x double>
+; CHECK-HSW: load <2 x i128>
+; CHECK-HSW: load <2 x i128>
 ; CHECK-HSW-NOT: load
-; CHECK-KNL: load <8 x double>
+; CHECK-KNL: load <4 x i128>
 ; CHECK-KNL-NOT: load
     %la = load <2 x double>, ptr %ptr
     %lb = load <2 x double>, ptr %b

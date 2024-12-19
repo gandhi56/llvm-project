@@ -5,10 +5,10 @@ target datalayout = "e-p:64:64-p1:64:64-p2:32:32-p3:32:32-p4:64:64-p5:32:32-p6:3
 declare i32 @llvm.amdgcn.workitem.id.x() #1
 
 ; CHECK-LABEL: @merge_v2p1i8(
-; CHECK: load <2 x i64>
-; CHECK: inttoptr i64 %{{[^ ]+}} to ptr addrspace(1)
-; CHECK: inttoptr i64 %{{[^ ]+}} to ptr addrspace(1)
-; CHECK: store <2 x i64> zeroinitializer
+; CHECK: load <2 x ptr addrspace(1)>
+; CHECK: extractelement <2 x ptr addrspace(1)> %0, i32 0
+; CHECK: extractelement <2 x ptr addrspace(1)> %0, i32 1
+; CHECK: store <2 x ptr addrspace(1)> zeroinitializer
 define amdgpu_kernel void @merge_v2p1i8(ptr addrspace(1) nocapture %a, ptr addrspace(1) nocapture readonly %b) #0 {
 entry:
   %a.1 = getelementptr inbounds ptr addrspace(1), ptr addrspace(1) %a, i64 1
@@ -24,10 +24,10 @@ entry:
 }
 
 ; CHECK-LABEL: @merge_v2p3i8(
-; CHECK: load <2 x i32>
-; CHECK: inttoptr i32 %{{[^ ]+}} to ptr addrspace(3)
-; CHECK: inttoptr i32 %{{[^ ]+}} to ptr addrspace(3)
-; CHECK: store <2 x i32> zeroinitializer
+; CHECK: load <2 x ptr addrspace(3)>
+; CHECK: extractelement <2 x ptr addrspace(3)> %0, i32 0
+; CHECK: extractelement <2 x ptr addrspace(3)> %0, i32 1
+; CHECK: store <2 x ptr addrspace(3)> zeroinitializer
 define amdgpu_kernel void @merge_v2p3i8(ptr addrspace(3) nocapture %a, ptr addrspace(3) nocapture readonly %b) #0 {
 entry:
   %a.1 = getelementptr inbounds ptr addrspace(3), ptr addrspace(3) %a, i64 1
@@ -42,9 +42,16 @@ entry:
   ret void
 }
 
+; FIXME: The following two load <2 x i32>'s can be merged into
+;   a single <4 x i32>. Same for stores.
 ; CHECK-LABEL: @merge_ptr_i32(
-; CHECK: load <4 x i32>
-; CHECK: store <4 x i32>
+; CHECK: load <2 x i32>
+; CHECK: extractelement <2 x i32> %0, i32 0
+; CHECK: extractelement <2 x i32> %0, i32 1
+; CHECK: inttoptr i32 %2 to ptr addrspace(3)
+; CHECK: load <2 x i32>
+; CHECK: store <2 x i32>
+; CHECK: store <2 x i32>
 define amdgpu_kernel void @merge_ptr_i32(ptr addrspace(3) nocapture %a, ptr addrspace(3) nocapture readonly %b) #0 {
 entry:
   %a.0 = getelementptr inbounds ptr addrspace(3), ptr addrspace(3) %a, i64 0
@@ -66,9 +73,15 @@ entry:
   ret void
 }
 
+; FIXME: Same issue as in the previous test
 ; CHECK-LABEL: @merge_ptr_i32_vec_first(
-; CHECK: load <4 x i32>
-; CHECK: store <4 x i32>
+; CHECK: load <2 x i32>
+; CHECK: load <2 x ptr addrspace(3)>
+; CHECK: extractelement <2 x ptr addrspace(3)> %0, i32 0
+; CHECK: extractelement <2 x ptr addrspace(3)> %0, i32 1
+; CHECK: ptrtoint
+; CHECK: store <2 x i32>
+; CHECK: store <2 x ptr addrspace(3)>
 define amdgpu_kernel void @merge_ptr_i32_vec_first(ptr addrspace(3) nocapture %a, ptr addrspace(3) nocapture readonly %b) #0 {
 entry:
   %a.0 = getelementptr inbounds ptr addrspace(3), ptr addrspace(3) %a, i64 0
@@ -105,9 +118,10 @@ entry:
 }
 
 ; CHECK-LABEL: @merge_load_ptr64_i64(
-; CHECK: load <2 x i64>
-; CHECK: [[ELT0:%[^ ]+]] = extractelement <2 x i64> %{{[^ ]+}}, i32 0
-; CHECK: inttoptr i64 [[ELT0]] to ptr addrspace(1)
+; CHECK: load <2 x ptr addrspace(1)>
+; CHECK: [[ELT0:%[^ ]+]] = extractelement <2 x ptr addrspace(1)> [[LOAD:%.*]], i32 0
+; CHECK: [[ELT1:%.*]] = extractelement <2 x ptr addrspace(1)> [[LOAD]], i32 1
+; CHECK: ptrtoint ptr addrspace(1) [[ELT1]] to i64
 define amdgpu_kernel void @merge_load_ptr64_i64(ptr addrspace(1) nocapture %a) #0 {
 entry:
   %a.1 =  getelementptr inbounds i64, ptr addrspace(1) %a, i64 1
@@ -119,9 +133,10 @@ entry:
 }
 
 ; CHECK-LABEL: @merge_store_ptr64_i64(
-; CHECK: [[ELT0:%[^ ]+]] = ptrtoint ptr addrspace(1) %ptr0 to i64
-; CHECK: insertelement <2 x i64> poison, i64 [[ELT0]], i32 0
-; CHECK: store <2 x i64>
+; CHECK: insertelement <2 x ptr addrspace(1)> poison, ptr addrspace(1) [[ELT0:%.*]], i32 0
+; CHECK: inttoptr i64 %val1 to ptr addrspace(1)
+; CHECK: insertelement <2 x ptr addrspace(1)> [[VEC:%.*]], ptr addrspace(1) [[ELT1:%.*]], i32 1
+; CHECK: store <2 x ptr addrspace(1)>
 define amdgpu_kernel void @merge_store_ptr64_i64(ptr addrspace(1) nocapture %a, ptr addrspace(1) %ptr0, i64 %val1) #0 {
 entry:
   %a.1 = getelementptr inbounds i64, ptr addrspace(1) %a, i64 1
@@ -134,6 +149,7 @@ entry:
 }
 
 ; CHECK-LABEL: @merge_store_i64_ptr64(
+; CHECK: insertelement <2 x i64> poison, i64 %val0, i32 0
 ; CHECK: [[ELT1:%[^ ]+]] = ptrtoint ptr addrspace(1) %ptr1 to i64
 ; CHECK: insertelement <2 x i64> %{{[^ ]+}}, i64 [[ELT1]], i32 1
 ; CHECK: store <2 x i64>
@@ -149,6 +165,7 @@ entry:
 
 ; CHECK-LABEL: @merge_load_i32_ptr32(
 ; CHECK: load <2 x i32>
+; CHECK: extractelement <2 x i32> %0, i32 0
 ; CHECK: [[ELT1:%[^ ]+]] = extractelement <2 x i32> %{{[^ ]+}}, i32 1
 ; CHECK: inttoptr i32 [[ELT1]] to ptr addrspace(3)
 define amdgpu_kernel void @merge_load_i32_ptr32(ptr addrspace(3) nocapture %a) #0 {
@@ -162,9 +179,10 @@ entry:
 }
 
 ; CHECK-LABEL: @merge_load_ptr32_i32(
-; CHECK: load <2 x i32>
-; CHECK: [[ELT0:%[^ ]+]] = extractelement <2 x i32> %{{[^ ]+}}, i32 0
-; CHECK: inttoptr i32 [[ELT0]] to ptr addrspace(3)
+; CHECK: load <2 x ptr addrspace(3)>
+; CHECK: [[ELT0:%[^ ]+]] = extractelement <2 x ptr addrspace(3)> %{{[^ ]+}}, i32 0
+; CHECK: [[ELT1:%[^ ]+]] = extractelement <2 x ptr addrspace(3)> %{{[^ ]+}}, i32 1
+; CHECK: ptrtoint ptr addrspace(3) [[ELT1]] to i32
 define amdgpu_kernel void @merge_load_ptr32_i32(ptr addrspace(3) nocapture %a) #0 {
 entry:
   %a.1 = getelementptr inbounds i32, ptr addrspace(3) %a, i32 1
@@ -176,9 +194,10 @@ entry:
 }
 
 ; CHECK-LABEL: @merge_store_ptr32_i32(
-; CHECK: [[ELT0:%[^ ]+]] = ptrtoint ptr addrspace(3) %ptr0 to i32
-; CHECK: insertelement <2 x i32> poison, i32 [[ELT0]], i32 0
-; CHECK: store <2 x i32>
+; CHECK: [[VEC0:%.*]] = insertelement <2 x ptr addrspace(3)> poison, ptr addrspace(3) [[ELT0:%.*]], i32 0
+; CHECK: [[ELT0:%.*]] = inttoptr i32 %val1 to ptr addrspace(3)
+; CHECK: insertelement <2 x ptr addrspace(3)> [[VEC0]], ptr addrspace(3) [[ELT0]], i32 1
+; CHECK: store <2 x ptr addrspace(3)>
 define amdgpu_kernel void @merge_store_ptr32_i32(ptr addrspace(3) nocapture %a, ptr addrspace(3) %ptr0, i32 %val1) #0 {
 entry:
   %a.1 = getelementptr inbounds i32, ptr addrspace(3) %a, i32 1
