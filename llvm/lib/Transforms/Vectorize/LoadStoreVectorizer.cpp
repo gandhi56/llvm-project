@@ -236,6 +236,8 @@ void reorder(Instruction *I) {
   }
 }
 
+using DisjointSets = MapVector<Instruction *, std::pair<Instruction *, EqClassKey>>;
+
 class Vectorizer {
   Function &F;
   AliasAnalysis &AA;
@@ -331,6 +333,8 @@ private:
   ///   - they all have the same value for getUnderlyingObject().
   EquivalenceClassMap collectEquivalenceClasses(BasicBlock::iterator Begin,
                                                 BasicBlock::iterator End);
+  
+  EquivalenceClassMap mergeEquivalenceClasses(DisjointSets &, SmallVector<Instruction *, 8> &);
 
   /// Partitions Instrs into "chains" where every instruction has a known
   /// constant offset from the first instr in the chain.
@@ -1305,10 +1309,27 @@ std::optional<APInt> Vectorizer::getConstantOffsetSelects(
   return std::nullopt;
 }
 
+Instruction *find(DisjointSets &S, Instruction *I) {
+  if (S[I].first == I)
+    return I;
+  return find(S, S[I].first);
+}
+
+bool merge(DisjointSets &S, Instruction *I, Instruction *J){
+  auto *RootI = find(S, I);
+  auto *RootJ = find(S, J);
+  if (RootI == RootJ)
+    return false;
+  S[J].first = RootI;
+  return true;
+}
+
 EquivalenceClassMap
 Vectorizer::collectEquivalenceClasses(BasicBlock::iterator Begin,
                                       BasicBlock::iterator End) {
   EquivalenceClassMap Ret;
+  DisjointSets Sets;
+  SmallVector<Instruction *, 8> Keys;
 
   auto GetUnderlyingObject = [](const Value *Ptr) -> const Value * {
     const Value *ObjPtr = llvm::getUnderlyingObject(Ptr);
@@ -1371,13 +1392,68 @@ Vectorizer::collectEquivalenceClasses(BasicBlock::iterator Begin,
         (VecTy && TTI.getLoadVectorFactor(VF, TySize, TySize / 8, VecTy) == 0))
       continue;
 
+    Sets[&I] = {&I, {GetUnderlyingObject(Ptr), 
+      AS, DL.getTypeSizeInBits(getLoadStoreType(&I)->getScalarType()), 
+      LI != nullptr}};
+    Keys.push_back(&I);
+
     Ret[{GetUnderlyingObject(Ptr), AS,
          DL.getTypeSizeInBits(getLoadStoreType(&I)->getScalarType()),
          /*IsLoad=*/LI != nullptr}]
         .emplace_back(&I);
   }
 
+  Ret = mergeEquivalenceClasses(Sets, Keys);
+
   return Ret;
+}
+
+EquivalenceClassMap Vectorizer::mergeEquivalenceClasses(DisjointSets &Sets, 
+  SmallVector<Instruction *, 8> &Keys) {
+  dbgs() << "Keys.size = " << Keys.size() << '\n';
+  IRBuilder<> Builder(Keys.back());
+  for (auto *It1 = Keys.begin(); It1 != Keys.end(); ++It1) {
+    auto *I = *It1;
+
+    for (auto *It2 = std::next(It1); It2 != Keys.end(); ++It2) {
+      auto *J = cast<Instruction>(*It2);
+      EqClassKey &KeyI = Sets[I].second;
+      EqClassKey &KeyJ = Sets[J].second;
+      unsigned ITyBits = std::get<2>(KeyI);
+      unsigned JTyBits = std::get<2>(KeyJ);
+
+      if (KeyI == KeyJ)
+        merge(Sets, I, J);
+
+      if (ITyBits == JTyBits)
+        continue;
+
+      // If the scalar types of the two loads/stores
+      // are different, attempt to insert a bitcast.
+      dbgs() << "KeyI " << KeyI << '\n';
+      dbgs() << "KeyJ " << KeyJ << '\n';
+      dbgs() << "J = " << *J << '\n';
+      auto *OrigTy = J->getType();
+      J->mutateType(I->getType());
+      dbgs() << *J->getParent() << '\n';
+    }
+  }
+
+  EquivalenceClassMap Map;
+
+  dbgs() << "Printing all disjoint sets:\n";
+  for (auto &[X, Y] : Sets) {
+    Map[Y.second].emplace_back(Y.first);
+  }
+
+  for (auto [X, Y] : Map) {
+    dbgs() << X << '\n';
+    for (auto *Inst : Y) {
+      dbgs() << "=> " << *Inst << '\n';
+    }
+  }
+
+  return Map;
 }
 
 std::vector<Chain> Vectorizer::gatherChains(ArrayRef<Instruction *> Instrs) {
