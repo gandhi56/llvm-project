@@ -135,6 +135,12 @@ using EqClassKey =
                unsigned /* Load/Store element size bits */,
                char /* IsLoad; char b/c bool can't be a DenseMap key */
                >;
+using EqChainKeyTy =
+    std::tuple<const Value * /* result of getUnderlyingObject() */,
+               unsigned /* AddrSpace */,
+               char /* IsLoad; char b/c bool can't be a DenseMap key */
+               >;
+
 [[maybe_unused]] llvm::raw_ostream &operator<<(llvm::raw_ostream &OS,
                                                const EqClassKey &K) {
   const auto &[UnderlyingObject, AddrSpace, ElementSize, IsLoad] = K;
@@ -174,6 +180,12 @@ void sortChainInOffsetOrder(Chain &C) {
   });
 }
 
+static bool chainElemsAreContiguous(const DataLayout &DL, const ChainElem *Prev, const ChainElem *Next) {
+  unsigned SzBits = DL.getTypeSizeInBits(getLoadStoreType(&*Prev->Inst));
+  APInt PrevReadEnd = Prev->OffsetFromLeader + SzBits / 8;
+  return Next->OffsetFromLeader == PrevReadEnd;
+}
+
 [[maybe_unused]] void dumpChain(ArrayRef<ChainElem> C) {
   for (const auto &E : C) {
     dbgs() << "  " << *E.Inst << " (offset " << E.OffsetFromLeader << ")\n";
@@ -182,6 +194,11 @@ void sortChainInOffsetOrder(Chain &C) {
 
 using EquivalenceClassMap =
     MapVector<EqClassKey, SmallVector<Instruction *, 8>>;
+
+using EqClassKeyToChainsTy = MapVector<std::tuple<const Value * /* result of getUnderlyingObject() */,
+               unsigned /* AddrSpace */,
+               char /* IsLoad; char b/c bool can't be a DenseMap key */
+               >, std::vector<Chain>>;
 
 // FIXME: Assuming stack alignment of 4 is always good enough
 constexpr unsigned StackAdjustedAlignment = 4;
@@ -343,6 +360,9 @@ private:
   /// Postcondition: For all i, ret[i][0].second == 0, because the first instr
   /// in the chain is the leader, and an instr touches distance 0 from itself.
   std::vector<Chain> gatherChains(ArrayRef<Instruction *> Instrs);
+
+  /// Loop over keys and attempt to merge chains mapped by the same key.
+  void mergeChains(EqClassKeyToChainsTy &);
 };
 
 class LoadStoreVectorizerLegacyPass : public FunctionPass {
@@ -479,49 +499,29 @@ bool Vectorizer::runOnPseudoBB(BasicBlock::iterator Begin,
   });
 
   bool Changed = false;
-  for (const auto &[EqClassKey, EqClass] :
-       collectEquivalenceClasses(Begin, End))
-    Changed |= runOnEquivalenceClass(EqClassKey, EqClass);
+  EqClassKeyToChainsTy KeyToChainsMap;
+  for (const auto &[EqClassKey, EqClass] : collectEquivalenceClasses(Begin, End)) {
+    auto [Ptr, AS, _, IsLoad] = EqClassKey;
+    for (Chain &C : gatherChains(EqClass)) {
+      for (Chain &C : splitChainByMayAliasInstrs(C))
+        for (Chain &C : splitChainByContiguity(C))
+          for (Chain &C : splitChainByAlignment(C))
+            KeyToChainsMap[{Ptr, AS, IsLoad}].push_back(C);
+    }
+  }
 
-  return Changed;
-}
+  mergeChains(KeyToChainsMap);
 
-bool Vectorizer::runOnEquivalenceClass(const EqClassKey &EqClassKey,
-                                       ArrayRef<Instruction *> EqClass) {
-  bool Changed = false;
+  for (auto [K, Chains] : KeyToChainsMap) {
+    for (auto &C : Chains) {
+      LLVM_DEBUG({
+        dbgs() << "LSV: Vectorizing chain with " << C.size() << " instructions:\n";
+        dumpChain(C);
+      });
+      Changed |= vectorizeChain(C);
+    }
+  }
 
-  LLVM_DEBUG({
-    dbgs() << "LSV: Running on equivalence class of size " << EqClass.size()
-           << " keyed on " << EqClassKey << ":\n";
-    for (Instruction *I : EqClass)
-      dbgs() << "  " << *I << "\n";
-  });
-
-  std::vector<Chain> Chains = gatherChains(EqClass);
-  LLVM_DEBUG(dbgs() << "LSV: Got " << Chains.size()
-                    << " nontrivial chains.\n";);
-  for (Chain &C : Chains)
-    Changed |= runOnChain(C);
-  return Changed;
-}
-
-bool Vectorizer::runOnChain(Chain &C) {
-  LLVM_DEBUG({
-    dbgs() << "LSV: Running on chain with " << C.size() << " instructions:\n";
-    dumpChain(C);
-  });
-
-  // Split up the chain into increasingly smaller chains, until we can finally
-  // vectorize the chains.
-  //
-  // (Don't be scared by the depth of the loop nest here.  These operations are
-  // all at worst O(n lg n) in the number of instructions, and splitting chains
-  // doesn't change the number of instrs.  So the whole loop nest is O(n lg n).)
-  bool Changed = false;
-  for (auto &C : splitChainByMayAliasInstrs(C))
-    for (auto &C : splitChainByContiguity(C))
-      for (auto &C : splitChainByAlignment(C))
-        Changed |= vectorizeChain(C);
   return Changed;
 }
 
@@ -590,7 +590,7 @@ std::vector<Chain> Vectorizer::splitChainByMayAliasInstrs(Chain &C) {
         NewChain = SmallVector<ChainElem, 1>({*ChainIt});
       }
     }
-    if (NewChain.size() > 1) {
+    if (NewChain.size() >= 1) {
       LLVM_DEBUG({
         dbgs() << "LSV: got nontrivial chain without aliasing instrs:\n";
         dumpChain(NewChain);
@@ -631,7 +631,7 @@ std::vector<Chain> Vectorizer::splitChainByContiguity(Chain &C) {
     APInt PrevReadEnd = Prev.OffsetFromLeader + SzBits / 8;
 
     // Add this instruction to the end of the current chain, or start a new one.
-    bool AreContiguous = It->OffsetFromLeader == PrevReadEnd;
+    bool AreContiguous = chainElemsAreContiguous(DL, &Prev, It);
     LLVM_DEBUG(dbgs() << "LSV: Instructions are "
                       << (AreContiguous ? "" : "not ") << "contiguous: "
                       << *Prev.Inst << " (ends at offset " << PrevReadEnd
@@ -643,8 +643,6 @@ std::vector<Chain> Vectorizer::splitChainByContiguity(Chain &C) {
       Ret.push_back({*It});
   }
 
-  // Filter out length-1 chains, these are uninteresting.
-  llvm::erase_if(Ret, [](const auto &Chain) { return Chain.size() <= 1; });
   return Ret;
 }
 
@@ -687,6 +685,9 @@ std::vector<Chain> Vectorizer::splitChainByAlignment(Chain &C) {
   //    of length N-1.
   if (C.empty())
     return {};
+
+  if (C.size() == 1)
+    return {C};
 
   sortChainInOffsetOrder(C);
 
@@ -1498,6 +1499,75 @@ Vectorizer::collectEquivalenceClasses(BasicBlock::iterator Begin,
   return Ret;
 }
 
+void Vectorizer::mergeChains(EqClassKeyToChainsTy &KeyToChains) {
+  if (KeyToChains.empty())
+    return;
+
+  // Merge chain J into chain I, mapped from the same key.
+  auto MergeChains = [&](EqChainKeyTy Key, unsigned I, unsigned J) -> bool {
+    Chain &CanonicalChain = KeyToChains[Key][I];
+    Chain &SubsumedChain = KeyToChains[Key][J];
+
+    Type *DestTy = getLoadStoreType(CanonicalChain.back().Inst);
+    for (auto &E : SubsumedChain) {
+      Type *OrigTy = getLoadStoreType(E.Inst);
+      Value *Ptr = getLoadStorePointerOperand(E.Inst);
+
+      if (OrigTy == DestTy) {
+        CanonicalChain.push_back(E);
+        continue;
+      }
+
+      if (OrigTy->isVectorTy() && DestTy->isVectorTy()) {
+        continue;
+      }
+
+      if (auto *LI = dyn_cast<LoadInst>(E.Inst)) {
+        Builder.SetInsertPoint(LI->getIterator());
+        auto *NewLoad = Builder.CreateLoad(DestTy, Ptr);
+        auto *Cast = Builder.CreateBitOrPointerCast(
+            NewLoad, OrigTy, NewLoad->getName() + ".cast");
+        LI->replaceAllUsesWith(Cast);
+        copyMetadataForLoad(*NewLoad, *LI);
+        LI->eraseFromParent();
+        CanonicalChain.emplace_back(NewLoad, E.OffsetFromLeader);
+      } else {
+        auto *SI = cast<StoreInst>(E.Inst);
+        Builder.SetInsertPoint(SI->getIterator());
+        auto *Cast = Builder.CreateBitOrPointerCast(
+            SI->getValueOperand(), DestTy,
+            SI->getValueOperand()->getName() + ".cast");
+        auto *NewStore = Builder.CreateStore(
+            Cast, getLoadStorePointerOperand(SI), SI->isVolatile());
+        copyMetadataForStore(*NewStore, *SI);
+        SI->eraseFromParent();
+        CanonicalChain.emplace_back(NewStore, E.OffsetFromLeader);
+      }
+
+    }
+    SubsumedChain.clear();
+    return true;
+  };
+
+  for (auto [Key, ChainsVec] : KeyToChains) {
+    for (int I = ChainsVec.size() - 1; I - 1 >= 0; --I) {
+      const ChainElem *Prev = &ChainsVec[I - 1].back();
+      const ChainElem *Next = &ChainsVec[I].front();
+      if (!chainElemsAreContiguous(DL, Prev, Next))
+        continue;
+
+      if (any_of(ChainsVec[I], [](ChainElem &E) {
+        Type *Ty = getLoadStoreType(E.Inst);
+        return Ty->isPointerTy() || Ty->isVectorTy();
+      })) {
+        continue;
+      }
+
+      MergeChains(Key, I - 1, I);
+    }
+  }
+}
+
 std::vector<Chain> Vectorizer::gatherChains(ArrayRef<Instruction *> Instrs) {
   if (Instrs.empty())
     return {};
@@ -1583,8 +1653,7 @@ std::vector<Chain> Vectorizer::gatherChains(ArrayRef<Instruction *> Instrs) {
   Ret.reserve(Chains.size());
   // Iterate over MRU rather than Chains so the order is deterministic.
   for (auto &E : MRU)
-    if (E.second.size() > 1)
-      Ret.emplace_back(std::move(E.second));
+    Ret.emplace_back(std::move(E.second));
   return Ret;
 }
 

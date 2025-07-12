@@ -131,6 +131,7 @@ entry:
 }
 
 ; Ideally this would be merged
+; Currently, LSV incorrectly identifies %ld.0 and %ld.1 as non-contiguous
 define amdgpu_kernel void @merge_load_i32_v2i16(ptr addrspace(1) nocapture %a) #0 {
 ; CHECK-LABEL: define amdgpu_kernel void @merge_load_i32_v2i16(
 ; CHECK-SAME: ptr addrspace(1) captures(none) [[A:%.*]]) #[[ATTR0]] {

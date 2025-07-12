@@ -448,6 +448,10 @@ LLVM_ABI void combineAAMetadata(Instruction *K, const Instruction *J);
 /// replacement for the source instruction).
 LLVM_ABI void copyMetadataForLoad(LoadInst &Dest, const LoadInst &Source);
 
+/// Copy the metadata from the source instruction to the destination (the
+/// replace)
+LLVM_ABI void copyMetadataForStore(StoreInst &Dest, const StoreInst &Source);
+
 /// Patch the replacement so that it is not more restrictive than the value
 /// being replaced. It assumes that the replacement does not get moved from
 /// its original position.

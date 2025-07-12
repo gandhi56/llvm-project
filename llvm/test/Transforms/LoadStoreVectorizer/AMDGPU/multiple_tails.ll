@@ -31,8 +31,7 @@ define amdgpu_kernel void @no_crash(i32 %arg) {
 
 ; GCN: load <2 x i32>{{.*}} %tmp1
 ; GCN: store <2 x i32> zeroinitializer{{.*}} %tmp1
-; GCN: load <2 x i32>{{.*}} %tmp2
-; GCN: load <2 x i32>{{.*}} %tmp4
+; GCN: load <4 x i32>{{.*}} %tmp2
 ; GCN: load i32{{.*}} %tmp5
 ; GCN: load i32{{.*}} %tmp5
 
