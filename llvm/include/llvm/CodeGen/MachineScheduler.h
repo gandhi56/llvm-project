@@ -1357,6 +1357,10 @@ ScheduleDAGMILive *createGenericSchedLive(MachineSchedContext *C);
 /// Create a generic scheduler with no vreg liveness or DAG mutation passes.
 ScheduleDAGMI *createGenericSchedPostRA(MachineSchedContext *C);
 
+std::unique_ptr<ScheduleDAGMutation>
+createCustomDAGMutation(const TargetInstrInfo *TII,
+                        const TargetRegisterInfo *TRI);
+
 /// If ReorderWhileClustering is set to true, no attempt will be made to
 /// reduce reordering due to store clustering.
 std::unique_ptr<ScheduleDAGMutation>

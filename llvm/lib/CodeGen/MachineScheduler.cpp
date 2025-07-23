@@ -19,6 +19,7 @@
 #include "llvm/ADT/STLExtras.h"
 #include "llvm/ADT/SmallVector.h"
 #include "llvm/ADT/Statistic.h"
+#include "llvm/ADT/StringRef.h"
 #include "llvm/ADT/iterator_range.h"
 #include "llvm/Analysis/AliasAnalysis.h"
 #include "llvm/CodeGen/LiveInterval.h"
@@ -68,6 +69,8 @@
 #include <tuple>
 #include <utility>
 #include <vector>
+#include <fstream>
+#include <sstream>
 
 using namespace llvm;
 
@@ -192,6 +195,10 @@ static cl::opt<bool> MISchedSortResourcesInTrace(
 static cl::opt<unsigned>
     MIResourceCutOff("misched-resource-cutoff", cl::Hidden,
                      cl::desc("Number of intervals to track"), cl::init(10));
+
+static cl::opt<std::string>
+    MutationCSVFile("dag-mutation-csv", cl::Hidden,
+                     cl::desc("Custom DAG Mutation CSV file"), cl::init(""));
 
 // DAG subtrees must have at least this many nodes.
 static const unsigned MinSubtreeSize = 8;
@@ -1817,10 +1824,78 @@ public:
                       bool ReorderWhileClustering)
       : BaseMemOpClusterMutation(tii, tri, true, ReorderWhileClustering) {}
 };
+class CustomDAGMutation : public ScheduleDAGMutation {
+  MapVector<unsigned int, SmallVector<std::pair<unsigned int, unsigned int>>> CSVData;
+
+public:
+  CustomDAGMutation() = delete;
+
+  CustomDAGMutation(const std::string Filename) {
+    dbgs() << "Reading " << Filename << '\n';
+    std::ifstream File(Filename);
+    
+    if (!File.is_open()) {
+      dbgs() << "Could not open file " << Filename << '\n';
+      exit(-1);
+    }
+
+    std::string Line;
+    while (std::getline(File, Line)) {
+      // bb, succ, pred
+      std::stringstream LineStream(Line);
+      std::string Cell;
+      int BB, From, To;
+      std::getline(LineStream, Cell, ',');
+      BB = std::stoi(Cell);
+
+      std::getline(LineStream, Cell, ',');
+      To = std::stoi(Cell);
+
+      std::getline(LineStream, Cell, ',');
+      From = std::stoi(Cell);
+
+
+      CSVData[BB].push_back({From, To});
+    }
+
+    File.close();
+
+    dbgs() << "CSVData:\n";
+    for (auto [K, V] : CSVData) {
+      for (auto [From, To] : V) {
+        dbgs() << K << " : " << From << " -> " << To << '\n';
+      }
+    }
+  }
+
+  void apply(ScheduleDAGInstrs *DAG) override {
+    unsigned int BlkNum = DAG->SUnits[0].getInstr()->getParent()->getNumber();
+    for (auto [From, To] : CSVData[BlkNum]) {
+      for (auto& SUa : DAG->SUnits) {
+        for (auto& SUb : DAG->SUnits) {
+          if (From != SUa.NodeNum || To != SUb.NodeNum)
+            continue;
+          dbgs() << "Adding an edge from " << From << " to " << To << '\n';
+          dbgs() << "From: " << *SUa.getInstr() << '\n';
+          dbgs() << "To: " << *SUb.getInstr() << '\n';
+          DAG->addEdge(&SUb, SDep(&SUa, SDep::Artificial));
+        }
+      }
+    }
+  }
+};
 
 } // end anonymous namespace
 
 namespace llvm {
+std::unique_ptr<ScheduleDAGMutation>
+createCustomDAGMutation(const TargetInstrInfo *TII,
+                        const TargetRegisterInfo *TRI) {
+  const std::string Filename = MutationCSVFile.getValue();
+  if (Filename.empty())
+    return nullptr;
+  return std::make_unique<CustomDAGMutation>(Filename);
+}
 
 std::unique_ptr<ScheduleDAGMutation>
 createLoadClusterDAGMutation(const TargetInstrInfo *TII,
