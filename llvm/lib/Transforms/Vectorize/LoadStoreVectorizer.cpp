@@ -97,6 +97,7 @@
 #include "llvm/Pass.h"
 #include "llvm/Support/Alignment.h"
 #include "llvm/Support/Casting.h"
+#include "llvm/Support/CommandLine.h"
 #include "llvm/Support/Debug.h"
 #include "llvm/Support/KnownBits.h"
 #include "llvm/Support/MathExtras.h"
@@ -122,17 +123,23 @@ using namespace llvm;
 STATISTIC(NumVectorInstructions, "Number of vector accesses generated");
 STATISTIC(NumScalarsVectorized, "Number of scalar accesses vectorized");
 
+static cl::opt<bool> EnableTypeNormalization(
+    "load-store-vectorizer-normalize-types",
+    cl::init(false),
+    cl::desc("Enable type normalization for mixed-type vectorization"));
+
 namespace {
 
 // Equivalence class key, the initial tuple by which we group loads/stores.
 // Loads/stores with different EqClassKeys are never merged.
 //
-// (We could in theory remove element-size from the this tuple.  We'd just need
-// to fix up the vector packing/unpacking code.)
+// Note: When EnableTypeNormalization is true, the third element is total type
+// size (allowing i32 and <2 x i16> to be grouped). When false, it's scalar
+// element size (original behavior).
 using EqClassKey =
     std::tuple<const Value * /* result of getUnderlyingObject() */,
                unsigned /* AddrSpace */,
-               unsigned /* Load/Store element size bits */,
+               unsigned /* Type size bits (total or scalar based on flag) */,
                char /* IsLoad; char b/c bool can't be a DenseMap key */
                >;
 [[maybe_unused]] llvm::raw_ostream &operator<<(llvm::raw_ostream &OS,
@@ -157,8 +164,11 @@ using EqClassKey =
 struct ChainElem {
   Instruction *Inst;
   APInt OffsetFromLeader;
+  Type *OriginalType; // Track original load/store type for normalization
+
   ChainElem(Instruction *Inst, APInt OffsetFromLeader)
-      : Inst(std::move(Inst)), OffsetFromLeader(std::move(OffsetFromLeader)) {}
+      : Inst(std::move(Inst)), OffsetFromLeader(std::move(OffsetFromLeader)),
+        OriginalType(getLoadStoreType(Inst)) {}
 };
 using Chain = SmallVector<ChainElem, 1>;
 
@@ -310,7 +320,18 @@ private:
   /// Gets the element type of the vector that the chain will load or store.
   /// This is nontrivial because the chain may contain elements of different
   /// types; e.g. it's legal to have a chain that contains both i32 and float.
-  Type *getChainElemTy(const Chain &C);
+  /// If NormalizedElemTy is provided, it overrides the normal selection logic.
+  Type *getChainElemTy(const Chain &C, Type *NormalizedElemTy = nullptr);
+
+  /// Analyzes a chain to determine if it has mixed types and computes the
+  /// optimal normalization type (finest granularity element type that divides
+  /// all types). Returns std::nullopt if no normalization needed (uniform
+  /// types) or if normalization is disabled.
+  std::optional<Type *> analyzeAndNormalizeChain(const Chain &C);
+
+  /// Checks if normalizing a chain is profitable by comparing the cost of
+  /// bitcasts plus vectorized access against scalar accesses.
+  bool isProfitableToNormalize(const Chain &C, Type *NormalizedElemTy);
 
   /// Determines whether ChainElem can be moved up (if IsLoad) or down (if
   /// !IsLoad) to ChainBegin -- i.e. there are no intervening may-alias
@@ -618,15 +639,22 @@ std::vector<Chain> Vectorizer::splitChainByContiguity(Chain &C) {
 
   sortChainInOffsetOrder(C);
 
+  // Determine if we need type normalization for this chain
+  std::optional<Type *> MaybeNormalizedTy = analyzeAndNormalizeChain(C);
+  Type *NormalizedElemTy = MaybeNormalizedTy.value_or(nullptr);
+
   LLVM_DEBUG({
     dbgs() << "LSV: splitChainByContiguity considering chain:\n";
     dumpChain(C);
+    if (NormalizedElemTy)
+      dbgs() << "LSV:   Using normalized type: " << *NormalizedElemTy << "\n";
   });
 
   std::vector<Chain> Ret;
   Ret.push_back({C.front()});
 
-  unsigned ChainElemTyBits = DL.getTypeSizeInBits(getChainElemTy(C));
+  // Use normalized type if available, otherwise use heuristic
+  unsigned ChainElemTyBits = DL.getTypeSizeInBits(getChainElemTy(C, NormalizedElemTy));
   APInt PrevReadEnd = C[0].OffsetFromLeader +
                       DL.getTypeStoreSize(getLoadStoreType(&*C[0].Inst));
   for (auto It = std::next(C.begin()), End = C.end(); It != End; ++It) {
@@ -665,8 +693,13 @@ std::vector<Chain> Vectorizer::splitChainByContiguity(Chain &C) {
   return Ret;
 }
 
-Type *Vectorizer::getChainElemTy(const Chain &C) {
+Type *Vectorizer::getChainElemTy(const Chain &C, Type *NormalizedElemTy) {
   assert(!C.empty());
+
+  // If a normalized type is provided, use it
+  if (NormalizedElemTy)
+    return NormalizedElemTy;
+
   // The rules are:
   //  - If there are any pointer types in the chain, use an integer type.
   //  - Prefer an integer type if it appears in the chain.
@@ -692,6 +725,119 @@ Type *Vectorizer::getChainElemTy(const Chain &C) {
   return getLoadStoreType(C[0].Inst)->getScalarType();
 }
 
+std::optional<Type *> Vectorizer::analyzeAndNormalizeChain(const Chain &C) {
+  if (!EnableTypeNormalization || C.empty())
+    return std::nullopt;
+
+  // Check if all elements have the same type
+  Type *FirstTy = C[0].OriginalType;
+  bool HasMixedTypes = false;
+  for (const ChainElem &E : C) {
+    if (E.OriginalType != FirstTy) {
+      HasMixedTypes = true;
+      break;
+    }
+  }
+
+  if (!HasMixedTypes)
+    return std::nullopt; // No normalization needed
+
+  // Find the finest granularity element type (GCD of all element sizes)
+  // Start with the first type's scalar element size
+  unsigned GCDBits =
+      DL.getTypeSizeInBits(FirstTy->isVectorTy()
+                               ? cast<VectorType>(FirstTy)->getElementType()
+                               : FirstTy);
+
+  for (const ChainElem &E : C) {
+    Type *Ty = E.OriginalType;
+    unsigned ElemBits =
+        DL.getTypeSizeInBits(Ty->isVectorTy()
+                                 ? cast<VectorType>(Ty)->getElementType()
+                                 : Ty);
+    GCDBits = std::gcd(GCDBits, ElemBits);
+  }
+
+  // Create the normalized element type
+  // Prefer integer types for simplicity in bitcasting
+  Type *NormalizedTy = Type::getIntNTy(F.getContext(), GCDBits);
+
+  LLVM_DEBUG(dbgs() << "LSV: analyzeAndNormalizeChain found mixed types, "
+                    << "normalized to " << *NormalizedTy << "\n");
+
+  return NormalizedTy;
+}
+
+bool Vectorizer::isProfitableToNormalize(const Chain &C,
+                                         Type *NormalizedElemTy) {
+  if (C.empty())
+    return false;
+
+  bool IsLoadChain = isa<LoadInst>(C[0].Inst);
+  unsigned AS = getLoadStoreAddressSpace(C[0].Inst);
+
+  // Calculate the total size of the chain
+  unsigned ChainBytes = 0;
+  APInt PrevReadEnd = C[0].OffsetFromLeader +
+                      DL.getTypeStoreSize(C[0].OriginalType);
+  ChainBytes = DL.getTypeStoreSize(C[0].OriginalType);
+  for (auto It = std::next(C.begin()), End = C.end(); It != End; ++It) {
+    unsigned SzBytes = DL.getTypeStoreSize(It->OriginalType);
+    APInt ReadEnd = It->OffsetFromLeader + SzBytes;
+    unsigned BytesAdded =
+        PrevReadEnd.sle(ReadEnd) ? (ReadEnd - PrevReadEnd).getSExtValue() : 0;
+    ChainBytes += BytesAdded;
+    PrevReadEnd = APIntOps::smax(PrevReadEnd, ReadEnd);
+  }
+
+  unsigned NumElem =
+      (8 * ChainBytes) / DL.getTypeSizeInBits(NormalizedElemTy);
+  Type *VecTy = FixedVectorType::get(NormalizedElemTy, NumElem);
+
+  // Estimate cost of scalar accesses
+  InstructionCost ScalarCost = 0;
+  for (const ChainElem &E : C) {
+    Type *Ty = E.OriginalType;
+    ScalarCost += TTI.getMemoryOpCost(
+        IsLoadChain ? Instruction::Load : Instruction::Store, Ty,
+        getLoadStoreAlignment(E.Inst), AS);
+  }
+
+  // Estimate cost of vectorized access
+  Align VecAlign = getLoadStoreAlignment(C[0].Inst);
+  InstructionCost VectorCost = TTI.getMemoryOpCost(
+      IsLoadChain ? Instruction::Load : Instruction::Store, VecTy, VecAlign,
+      AS);
+
+  // Estimate cost of bitcasts needed for normalization
+  InstructionCost CastCost = 0;
+  for (const ChainElem &E : C) {
+    Type *OrigTy = E.OriginalType;
+    // For loads: cast from normalized vector elements back to original type
+    // For stores: cast from original type to normalized vector elements
+    if (OrigTy != NormalizedElemTy && !OrigTy->isVectorTy()) {
+      CastCost += TTI.getCastInstrCost(Instruction::BitCast, OrigTy,
+                                       NormalizedElemTy,
+                                       TTI::CastContextHint::None);
+    } else if (OrigTy->isVectorTy()) {
+      // Vector types may need multiple element extracts/inserts plus bitcasts
+      auto *VOrigTy = cast<FixedVectorType>(OrigTy);
+      unsigned NumElems = VOrigTy->getNumElements();
+      CastCost += NumElems * TTI.getCastInstrCost(
+                                 Instruction::BitCast,
+                                 VOrigTy->getElementType(), NormalizedElemTy,
+                                 TTI::CastContextHint::None);
+    }
+  }
+
+  LLVM_DEBUG(dbgs() << "LSV: isProfitableToNormalize: ScalarCost="
+                    << ScalarCost << ", VectorCost=" << VectorCost
+                    << ", CastCost=" << CastCost << "\n");
+
+  // Vectorization is profitable if total cost is less than scalar cost
+  return (VectorCost + CastCost) < ScalarCost;
+}
+
 std::vector<Chain> Vectorizer::splitChainByAlignment(Chain &C) {
   // We use a simple greedy algorithm.
   //  - Given a chain of length N, find all prefixes that
@@ -707,9 +853,15 @@ std::vector<Chain> Vectorizer::splitChainByAlignment(Chain &C) {
 
   sortChainInOffsetOrder(C);
 
+  // Determine if we need type normalization for this chain
+  std::optional<Type *> MaybeNormalizedTy = analyzeAndNormalizeChain(C);
+  Type *NormalizedElemTy = MaybeNormalizedTy.value_or(nullptr);
+
   LLVM_DEBUG({
     dbgs() << "LSV: splitChainByAlignment considering chain:\n";
     dumpChain(C);
+    if (NormalizedElemTy)
+      dbgs() << "LSV:   Using normalized type: " << *NormalizedElemTy << "\n";
   });
 
   bool IsLoadChain = isa<LoadInst>(C[0].Inst);
@@ -763,7 +915,8 @@ std::vector<Chain> Vectorizer::splitChainByAlignment(Chain &C) {
           dbgs() << "LSV: splitChainByAlignment considering candidate chain ["
                  << *C[CBegin].Inst << " ... " << *C[CEnd].Inst << "]\n");
 
-      Type *VecElemTy = getChainElemTy(C);
+      // Use normalized type if available, otherwise use heuristic
+      Type *VecElemTy = getChainElemTy(C, NormalizedElemTy);
       // Note, VecElemTy is a power of 2, but might be less than one byte.  For
       // example, we can vectorize 2 x <2 x i4> to <4 x i4>, and in this case
       // VecElemTy would be i4.
@@ -889,7 +1042,17 @@ bool Vectorizer::vectorizeChain(Chain &C) {
     dumpChain(C);
   });
 
-  Type *VecElemTy = getChainElemTy(C);
+  // Check if we need type normalization
+  std::optional<Type *> MaybeNormalizedTy = analyzeAndNormalizeChain(C);
+  Type *NormalizedElemTy = MaybeNormalizedTy.value_or(nullptr);
+
+  // If normalization is needed, check if it's profitable
+  if (NormalizedElemTy && !isProfitableToNormalize(C, NormalizedElemTy)) {
+    LLVM_DEBUG(dbgs() << "LSV: Skipping chain - normalization not profitable\n");
+    return false;
+  }
+
+  Type *VecElemTy = getChainElemTy(C, NormalizedElemTy);
   bool IsLoadChain = isa<LoadInst>(C[0].Inst);
   unsigned AS = getLoadStoreAddressSpace(C[0].Inst);
   unsigned BytesAdded = DL.getTypeStoreSize(getLoadStoreType(&*C[0].Inst));
@@ -921,11 +1084,14 @@ bool Vectorizer::vectorizeChain(Chain &C) {
                                    MaybeAlign(), DL, C[0].Inst, nullptr, &DT));
   }
 
-  // All elements of the chain must have the same scalar-type size.
+  // All elements of the chain must have the same scalar-type size, unless
+  // we're doing type normalization.
 #ifndef NDEBUG
-  for (const ChainElem &E : C)
-    assert(DL.getTypeStoreSize(getLoadStoreType(E.Inst)->getScalarType()) ==
-           DL.getTypeStoreSize(VecElemTy));
+  if (!NormalizedElemTy) {
+    for (const ChainElem &E : C)
+      assert(DL.getTypeStoreSize(getLoadStoreType(E.Inst)->getScalarType()) ==
+             DL.getTypeStoreSize(VecElemTy));
+  }
 #endif
 
   Instruction *VecInst;
@@ -949,22 +1115,40 @@ bool Vectorizer::vectorizeChain(Chain &C) {
     for (const ChainElem &E : C) {
       Instruction *I = E.Inst;
       Value *V;
-      Type *T = getLoadStoreType(I);
+      Type *T = E.OriginalType; // Use original type from ChainElem
       unsigned EOffset =
           (E.OffsetFromLeader - C[0].OffsetFromLeader).getZExtValue();
       unsigned VecIdx = 8 * EOffset / DL.getTypeSizeInBits(VecElemTy);
+
       if (!VecTy->isVectorTy()) {
         V = VecInst;
       } else if (auto *VT = dyn_cast<FixedVectorType>(T)) {
+        // Extract a sub-vector from the main vector
         auto Mask = llvm::to_vector<8>(
             llvm::seq<int>(VecIdx, VecIdx + VT->getNumElements()));
         V = Builder.CreateShuffleVector(VecInst, Mask, I->getName());
       } else {
+        // Extract a single element
         V = Builder.CreateExtractElement(VecInst, Builder.getInt32(VecIdx),
                                          I->getName());
       }
+
+      // If we're doing type normalization and types differ, add bitcast
+      if (NormalizedElemTy && V->getType() != I->getType()) {
+        // For vector types, we may need to bitcast the extracted vector
+        if (auto *VT = dyn_cast<FixedVectorType>(T)) {
+          // Bitcast from normalized vector to original vector type
+          V = Builder.CreateBitCast(V, T, I->getName() + ".cast");
+        } else {
+          // Bitcast from normalized scalar to original scalar type
+          V = Builder.CreateBitCast(V, T, I->getName() + ".cast");
+        }
+      }
+
+      // Final cast if types still don't match (e.g., pointer casts)
       if (V->getType() != I->getType())
         V = Builder.CreateBitOrPointerCast(V, I->getType());
+
       I->replaceAllUsesWith(V);
     }
 
@@ -997,8 +1181,12 @@ bool Vectorizer::vectorizeChain(Chain &C) {
     // Build the vector to store.
     Value *Vec = PoisonValue::get(VecTy);
     auto InsertElem = [&](Value *V, unsigned VecIdx) {
-      if (V->getType() != VecElemTy)
+      // When normalizing, bitcast to normalized element type first
+      if (NormalizedElemTy && V->getType() != VecElemTy) {
+        V = Builder.CreateBitCast(V, VecElemTy);
+      } else if (V->getType() != VecElemTy) {
         V = Builder.CreateBitOrPointerCast(V, VecElemTy);
+      }
       Vec = Builder.CreateInsertElement(Vec, V, Builder.getInt32(VecIdx));
     };
     for (const ChainElem &E : C) {
@@ -1006,15 +1194,35 @@ bool Vectorizer::vectorizeChain(Chain &C) {
       unsigned EOffset =
           (E.OffsetFromLeader - C[0].OffsetFromLeader).getZExtValue();
       unsigned VecIdx = 8 * EOffset / DL.getTypeSizeInBits(VecElemTy);
-      if (FixedVectorType *VT =
-              dyn_cast<FixedVectorType>(getLoadStoreType(I))) {
-        for (int J = 0, JE = VT->getNumElements(); J < JE; ++J) {
-          InsertElem(Builder.CreateExtractElement(I->getValueOperand(),
-                                                  Builder.getInt32(J)),
-                     VecIdx++);
+      Type *OrigTy = E.OriginalType;
+
+      if (auto *VT = dyn_cast<FixedVectorType>(OrigTy)) {
+        // Handle vector store values
+        Value *StoreVal = I->getValueOperand();
+        // If normalizing, bitcast the entire vector first
+        if (NormalizedElemTy && VT->getElementType() != VecElemTy) {
+          // Bitcast vector to normalized element type vector
+          unsigned NumElems = VT->getNumElements();
+          Type *NormalizedVecTy =
+              FixedVectorType::get(VecElemTy, NumElems);
+          StoreVal = Builder.CreateBitCast(StoreVal, NormalizedVecTy);
+        }
+        // Extract and insert each element
+        unsigned NumElems =
+            cast<FixedVectorType>(StoreVal->getType())->getNumElements();
+        for (unsigned J = 0; J < NumElems; ++J) {
+          Value *Elem =
+              Builder.CreateExtractElement(StoreVal, Builder.getInt32(J));
+          InsertElem(Elem, VecIdx++);
         }
       } else {
-        InsertElem(I->getValueOperand(), VecIdx);
+        // Handle scalar store values
+        Value *StoreVal = I->getValueOperand();
+        // If normalizing and types differ, bitcast first
+        if (NormalizedElemTy && StoreVal->getType() != VecElemTy) {
+          StoreVal = Builder.CreateBitCast(StoreVal, VecElemTy);
+        }
+        InsertElem(StoreVal, VecIdx);
       }
     }
 
@@ -1417,7 +1625,7 @@ void Vectorizer::mergeEquivalenceClasses(EquivalenceClassMap &EQClasses) const {
     }
     UObjectToUObjectMap UltimateTargetsMap;
     for (const auto *UObject : UObjects) {
-      auto Target = UObject;
+      const auto *Target = UObject;
       auto It = IndirectionMap.find(Target);
       for (; It != IndirectionMap.end(); It = IndirectionMap.find(Target))
         Target = It->second;
@@ -1530,8 +1738,14 @@ Vectorizer::collectEquivalenceClasses(BasicBlock::iterator Begin,
         (VecTy && TTI.getLoadVectorFactor(VF, TySize, TySize / 8, VecTy) == 0))
       continue;
 
-    Ret[{GetUnderlyingObject(Ptr), AS,
-         DL.getTypeSizeInBits(getLoadStoreType(&I)->getScalarType()),
+    // When type normalization is enabled, group by total type size (allowing
+    // mixed types like i32 and <2 x i16>). Otherwise, use scalar element size.
+    unsigned TypeSizeForKey = EnableTypeNormalization
+                                  ? DL.getTypeSizeInBits(getLoadStoreType(&I))
+                                  : DL.getTypeSizeInBits(
+                                        getLoadStoreType(&I)->getScalarType());
+
+    Ret[{GetUnderlyingObject(Ptr), AS, TypeSizeForKey,
          /*IsLoad=*/LI != nullptr}]
         .emplace_back(&I);
   }
