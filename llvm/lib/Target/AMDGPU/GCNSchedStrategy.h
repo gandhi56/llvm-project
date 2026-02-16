@@ -15,6 +15,7 @@
 
 #include "GCNRegPressure.h"
 #include "llvm/ADT/DenseMap.h"
+#include <optional>
 #include "llvm/ADT/MapVector.h"
 #include "llvm/CodeGen/MachineBasicBlock.h"
 #include "llvm/CodeGen/MachineBlockFrequencyInfo.h"
@@ -74,6 +75,19 @@ protected:
   void printCandidateDecision(const SchedCandidate &Current,
                               const SchedCandidate &Preferred);
 
+  /// For gfx950 32-cycle MFMA co-exec: prefer next MFMA after ~6 VALU.
+  /// Returns true if TryCand should be preferred, false if Cand should be kept,
+  /// or std::nullopt if no preference (caller continues with normal heuristics).
+  std::optional<bool> preferCandidateForMFMACoexec(const SchedCandidate &Cand,
+                                                   const SchedCandidate &TryCand) const;
+
+  /// Count of VALU instructions scheduled since the last MFMA (bottom-up order).
+  /// Used to prefer scheduling the next MFMA once MFMACoexecVALUTargetCount
+  /// VALUs have been scheduled (gfx950 32-cycle co-exec window).
+  mutable int VALUSinceLastMFMA = 0xFFFFFFF;
+
+  static const int MFMACoexecVALUTargetCount = 6;
+
   std::vector<unsigned> Pressure;
 
   std::vector<unsigned> MaxPressure;
@@ -128,6 +142,9 @@ public:
 
   GCNSchedStrategy(const MachineSchedContext *C);
 
+  bool tryCandidate(SchedCandidate &Cand, SchedCandidate &TryCand,
+                    SchedBoundary *Zone) const override;
+
   SUnit *pickNode(bool &IsTopNode) override;
 
   void schedNode(SUnit *SU, bool IsTopNode) override;
@@ -180,6 +197,33 @@ protected:
 
 public:
   GCNMaxMemoryClauseSchedStrategy(const MachineSchedContext *C);
+};
+
+/// GCN PostRA scheduler strategy. Extends PostGenericScheduler with
+/// MFMA co-execution heuristics for GFX950.
+class GCNPostGenericScheduler final : public PostGenericScheduler {
+  MachineFunction *MF = nullptr;
+
+  /// Count of VALU instructions scheduled since the last MFMA (bottom-up).
+  unsigned VALUSinceLastMFMA = 0xFFFFFFF;
+
+  static const unsigned MFMACoexecVALUTargetCount = 6;
+
+  /// For gfx950 MFMA co-exec: prefer next MFMA after ~6 VALU.
+  std::optional<bool>
+  preferCandidateForMFMACoexec(const SchedCandidate &Cand,
+                               const SchedCandidate &TryCand) const;
+
+protected:
+  bool tryCandidate(SchedCandidate &Cand, SchedCandidate &TryCand) override;
+
+public:
+  GCNPostGenericScheduler(const MachineSchedContext *C)
+      : PostGenericScheduler(C) {}
+
+  void initialize(ScheduleDAGMI *Dag) override;
+
+  void schedNode(SUnit *SU, bool IsTopNode) override;
 };
 
 class ScheduleMetrics {

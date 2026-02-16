@@ -26,7 +26,9 @@
 #include "GCNSchedStrategy.h"
 #include "AMDGPUIGroupLP.h"
 #include "GCNRegPressure.h"
+#include "GCNSubtarget.h"
 #include "SIMachineFunctionInfo.h"
+#include "SIInstrInfo.h"
 #include "Utils/AMDGPUBaseInfo.h"
 #include "llvm/ADT/BitVector.h"
 #include "llvm/ADT/STLExtras.h"
@@ -162,6 +164,8 @@ void GCNSchedStrategy::initialize(ScheduleDAGMI *DAG) {
                     << ", VGPRExcessLimit = " << VGPRExcessLimit
                     << ", SGPRCriticalLimit = " << SGPRCriticalLimit
                     << ", SGPRExcessLimit = " << SGPRExcessLimit << "\n\n");
+
+  VALUSinceLastMFMA = -1;
 }
 
 /// Checks whether \p SU can use the cached DAG pressure diffs to compute the
@@ -411,6 +415,25 @@ void GCNSchedStrategy::pickNodeFromQueue(SchedBoundary &Zone,
       VGPRPressure = T->getPressure().getArchVGPRNum();
     }
   }
+
+  // If we have scheduled enough VALUs, try to pick the next MFMA from the
+  // pending queue.
+  // This logic is specific to GFX950
+  if (MF && (VALUSinceLastMFMA != 0xFFFFFFF && VALUSinceLastMFMA >= MFMACoexecVALUTargetCount)) {
+    const GCNSubtarget &ST = MF->getSubtarget<GCNSubtarget>();
+    const SIInstrInfo *TII = ST.getInstrInfo();
+    if (ST.hasGFX950Insts()) {
+      for (SUnit *SU : Zone.Pending) {
+        if (SU->isInstr() && TII->isMFMA(*SU->getInstr())) {
+          initCandidate(Cand, SU, Zone.isTop(), RPTracker, SRI, SGPRPressure,
+                        VGPRPressure, IsBottomUp);
+          Cand.Reason = NodeOrder;
+          IsPending = true;
+          return;
+        }
+      }
+    }
+  }
   LLVM_DEBUG(dbgs() << "Available Q:\n");
   ReadyQueue &AQ = Zone.Available;
   for (SUnit *SU : AQ) {
@@ -629,6 +652,19 @@ void GCNSchedStrategy::schedNode(SUnit *SU, bool IsTopNode) {
               : UpwardTracker.recede(*MI);
   }
 
+  // Track VALU count since last MFMA for gfx950 32-cycle co-exec (bottom-up).
+  if (MF && !IsTopNode) {
+    const GCNSubtarget &ST = MF->getSubtarget<GCNSubtarget>();
+    if (ST.hasGFX950Insts() && SU->isInstr()) {
+      MachineInstr *MI = SU->getInstr();
+      const SIInstrInfo *TII = ST.getInstrInfo();
+      if (TII->isMFMA(*MI))
+        VALUSinceLastMFMA = 0;
+      else if (TII->isVALU(*MI))
+        VALUSinceLastMFMA += 1;
+    }
+  }
+
   return GenericScheduler::schedNode(SU, IsTopNode);
 }
 
@@ -698,6 +734,40 @@ bool GCNSchedStrategy::tryPendingCandidate(SchedCandidate &Cand,
   return false;
 }
 
+std::optional<bool> GCNSchedStrategy::preferCandidateForMFMACoexec(
+    const SchedCandidate &Cand, const SchedCandidate &TryCand) const {
+
+  const GCNSubtarget &ST = MF->getSubtarget<GCNSubtarget>();
+
+  // If an MFMA wasn't scheduled yet, return with a nullopt.
+  if (!MF || !ST.hasGFX950Insts())
+    return std::nullopt;
+
+  if (!Cand.isValid() || !Cand.SU->getInstr())
+    return std::nullopt;
+
+  const SIInstrInfo *TII = ST.getInstrInfo();
+  bool TryIsMFMA = TryCand.SU->isInstr() &&
+                   TII->isMFMA(*TryCand.SU->getInstr());
+  
+  if (VALUSinceLastMFMA >= MFMACoexecVALUTargetCount && TryIsMFMA)
+    return true;
+  return false;
+}
+
+bool GCNSchedStrategy::tryCandidate(SchedCandidate &Cand,
+                                    SchedCandidate &TryCand,
+                                    SchedBoundary *Zone) const {
+  if (std::optional<bool> Prefer = preferCandidateForMFMACoexec(Cand, TryCand)) {
+    if (*Prefer) {
+      TryCand.Reason = NodeOrder;
+      return true;
+    }
+    return false;
+  }
+  return GenericScheduler::tryCandidate(Cand, TryCand, Zone);
+}
+
 GCNMaxOccupancySchedStrategy::GCNMaxOccupancySchedStrategy(
     const MachineSchedContext *C, bool IsLegacyScheduler)
     : GCNSchedStrategy(C) {
@@ -722,6 +792,16 @@ bool GCNMaxILPSchedStrategy::tryCandidate(SchedCandidate &Cand,
   if (!Cand.isValid()) {
     TryCand.Reason = NodeOrder;
     return true;
+  }
+
+  // gfx950 32-cycle MFMA co-exec: prefer next MFMA after ~6 VALU.
+  if (std::optional<bool> Prefer =
+          preferCandidateForMFMACoexec(Cand, TryCand)) {
+    if (*Prefer) {
+      TryCand.Reason = NodeOrder;
+      return true;
+    }
+    return false;
   }
 
   // Avoid spilling by exceeding the register limit.
@@ -824,6 +904,16 @@ bool GCNMaxMemoryClauseSchedStrategy::tryCandidate(SchedCandidate &Cand,
   if (!Cand.isValid()) {
     TryCand.Reason = NodeOrder;
     return true;
+  }
+
+  // gfx950 32-cycle MFMA co-exec: prefer next MFMA after ~6 VALU.
+  if (std::optional<bool> Prefer =
+          preferCandidateForMFMACoexec(Cand, TryCand)) {
+    if (*Prefer) {
+      TryCand.Reason = NodeOrder;
+      return true;
+    }
+    return false;
   }
 
   // Bias PhysReg Defs and copies to their uses and defined respectively.
@@ -933,6 +1023,62 @@ bool GCNMaxMemoryClauseSchedStrategy::tryCandidate(SchedCandidate &Cand,
   }
 
   return false;
+}
+
+// GCNPostGenericScheduler
+
+void GCNPostGenericScheduler::initialize(ScheduleDAGMI *Dag) {
+  PostGenericScheduler::initialize(Dag);
+  MF = &Dag->MF;
+}
+
+std::optional<bool> GCNPostGenericScheduler::preferCandidateForMFMACoexec(
+    const SchedCandidate &Cand, const SchedCandidate &TryCand) const {
+  const GCNSubtarget &ST = MF->getSubtarget<GCNSubtarget>();
+
+  if (!MF || !ST.hasGFX950Insts())
+    return std::nullopt;
+
+  if (!Cand.isValid() || !Cand.SU->getInstr())
+    return std::nullopt;
+
+  const SIInstrInfo *TII = ST.getInstrInfo();
+  bool TryIsMFMA =
+      TryCand.SU->isInstr() && TII->isMFMA(*TryCand.SU->getInstr());
+
+  if (VALUSinceLastMFMA >= MFMACoexecVALUTargetCount && TryIsMFMA)
+    return true;
+  return false;
+}
+
+bool GCNPostGenericScheduler::tryCandidate(SchedCandidate &Cand,
+                                           SchedCandidate &TryCand) {
+  if (std::optional<bool> Prefer =
+          preferCandidateForMFMACoexec(Cand, TryCand)) {
+    if (*Prefer) {
+      TryCand.Reason = NodeOrder;
+      return true;
+    }
+    return false;
+  }
+  return PostGenericScheduler::tryCandidate(Cand, TryCand);
+}
+
+void GCNPostGenericScheduler::schedNode(SUnit *SU, bool IsTopNode) {
+  // Track VALU count since last MFMA for gfx950 co-exec (bottom-up).
+  if (MF && !IsTopNode) {
+    const GCNSubtarget &ST = MF->getSubtarget<GCNSubtarget>();
+    if (ST.hasGFX950Insts() && SU->isInstr()) {
+      MachineInstr *MI = SU->getInstr();
+      const SIInstrInfo *TII = ST.getInstrInfo();
+      if (TII->isMFMA(*MI))
+        VALUSinceLastMFMA = 0;
+      else if (TII->isVALU(*MI))
+        VALUSinceLastMFMA += 1;
+    }
+  }
+
+  PostGenericScheduler::schedNode(SU, IsTopNode);
 }
 
 GCNScheduleDAGMILive::GCNScheduleDAGMILive(
