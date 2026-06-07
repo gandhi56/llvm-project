@@ -95,6 +95,11 @@ static cl::opt<bool> DisableFDivExpand(
   cl::ReallyHidden,
   cl::init(false));
 
+static cl::opt<bool> AssumeNonNegativeFract(
+    "amdgpu-assume-non-negative-fract",
+    cl::desc("Assume source of fract is non-negative"),
+    cl::ReallyHidden, cl::init(false));
+
 class AMDGPUCodeGenPrepareImpl
     : public InstVisitor<AMDGPUCodeGenPrepareImpl, bool> {
 public:
@@ -120,6 +125,14 @@ public:
         DL(F.getDataLayout()), SQ(DL, TLI, DT, AC),
         HasFP32DenormalFlush(SIModeRegisterDefaults(F, ST).FP32Denormals ==
                              DenormalMode::getPreserveSign()) {}
+
+  bool assumeNonNegativeFract() const {
+    if (AssumeNonNegativeFract)
+      return true;
+    return F.hasFnAttribute("amdgpu-assume-non-negative-fract") &&
+           F.getFnAttribute("amdgpu-assume-non-negative-fract")
+               .getValueAsBool();
+  }
 
   Function *getSqrtF32() const {
     if (SqrtF32)
@@ -251,6 +264,7 @@ public:
 
 public:
   bool visitFDiv(BinaryOperator &I);
+  bool visitFSub(BinaryOperator &I);
 
   bool visitInstruction(Instruction &I) { return false; }
   bool visitBinaryOperator(BinaryOperator &I);
@@ -996,6 +1010,37 @@ bool AMDGPUCodeGenPrepareImpl::visitFDiv(BinaryOperator &FDiv) {
   }
 
   return true;
+}
+
+bool AMDGPUCodeGenPrepareImpl::visitFSub(BinaryOperator &I) {
+  if (ST.hasFractBug())
+    return false;
+
+  Type *Ty = I.getType();
+  if (!isLegalFloatingTy(Ty->getScalarType()))
+    return false;
+
+  Value *LHS = I.getOperand(0);
+  Value *RHS = I.getOperand(1);
+  Value *FractSrc = nullptr;
+
+  // Match: fsub x, sitofp(fptosi(x)) or fsub x, uitofp(fptoui(x))
+  if ((match(RHS, m_SIToFP(m_FPToSI(m_Value(FractSrc)))) ||
+       match(RHS, m_UIToFP(m_FPToUI(m_Value(FractSrc))))) &&
+      FractSrc == LHS) {
+    if (assumeNonNegativeFract() ||
+        cannotBeOrderedLessThanZero(FractSrc, SQ.getWithInstruction(&I))) {
+      IRBuilder<> Builder(&I);
+      Builder.setFastMathFlags(I.getFastMathFlags());
+      Value *Fract = applyFractPat(Builder, FractSrc);
+      Fract->takeName(&I);
+      I.replaceAllUsesWith(Fract);
+      DeadVals.push_back(&I);
+      return true;
+    }
+  }
+
+  return false;
 }
 
 static std::pair<Value*, Value*> getMul64(IRBuilder<> &Builder,
