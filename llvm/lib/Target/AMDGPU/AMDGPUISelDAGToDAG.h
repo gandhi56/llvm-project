@@ -207,6 +207,8 @@ private:
   bool SelectSMRDImm(SDValue Addr, SDValue &SBase, SDValue &Offset) const;
   bool SelectSMRDImm32(SDValue Addr, SDValue &SBase, SDValue &Offset) const;
   bool SelectScaleOffset(SDNode *N, SDValue &Offset, bool IsSigned) const;
+  SDValue matchScaledGVSOffset(SDNode *MemNode, SDValue Off) const;
+  bool assume32BitGlobalOffset() const;
   bool SelectSMRDSgpr(SDNode *N, SDValue Addr, SDValue &SBase, SDValue &SOffset,
                       SDValue &CPol) const;
   bool SelectSMRDSgprImm(SDNode *N, SDValue Addr, SDValue &SBase,

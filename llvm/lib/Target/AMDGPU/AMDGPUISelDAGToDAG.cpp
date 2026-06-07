@@ -29,6 +29,7 @@
 #include "llvm/IR/IntrinsicsAMDGPU.h"
 #include "llvm/InitializePasses.h"
 #include "llvm/Support/ErrorHandling.h"
+#include "llvm/Support/CommandLine.h"
 
 #ifdef EXPENSIVE_CHECKS
 #include "llvm/Analysis/LoopInfo.h"
@@ -44,6 +45,10 @@ using namespace llvm;
 //===----------------------------------------------------------------------===//
 
 namespace {
+static cl::opt<bool> Assume32BitGlobalOffset(
+    "amdgpu-assume-32bit-global-offset", cl::init(false), cl::Hidden,
+    cl::desc("Assume all global offsets fit in 32 bits (i.e. global heap < 4GB)"));
+
 static SDValue stripBitcast(SDValue Val) {
   return Val.getOpcode() == ISD::BITCAST ? Val.getOperand(0) : Val;
 }
@@ -2010,6 +2015,93 @@ static SDValue matchExtFromI32orI32(SDValue Op, bool IsSigned,
   return (ExtSrc.getValueType() == MVT::i32) ? ExtSrc : SDValue();
 }
 
+// Returns true if the function has opted in to assuming all global offsets
+// fit in 32 bits (i.e. the global heap never exceeds 4 GB). This lets us
+// use the SADDR addressing mode for sext(shl(i32 x, C)) offsets even when
+// we cannot statically prove the shift does not overflow i32.
+bool AMDGPUDAGToDAGISel::assume32BitGlobalOffset() const {
+  if (Assume32BitGlobalOffset)
+    return true;
+  const MachineFunction &MF = CurDAG->getMachineFunction();
+  return MF.getFunction()
+      .getFnAttribute("amdgpu-assume-32bit-global-offset")
+      .getValueAsBool();
+}
+
+
+// Try to match Off = EXT(shl(i32 x, C)) or Off = shl(EXT(i32 x), C)
+// where (1<<C) == access size.
+// On pre-gfx1250 targets that lack hasScaleOffset(), materialise
+//   VOffset = V_LSHLREV_B32  C, x     (a 32-bit byte offset)
+// and return it. The hardware zero-extends the 32-bit voffset to 64 bits,
+// so the effective address is saddr64 + zext32(x << C), which equals
+// saddr64 + sext64(shl(x, C)) iff x << C does not overflow i32 (i.e. the
+// sign bit of the product is zero). We gate on either:
+//   - computeKnownBits can prove the sign bit of (x << C) is zero, or
+//   - the function carries "amdgpu-assume-32bit-global-offset".
+// gfx1250 already has hasScaleOffset(); early-return null for that target.
+SDValue AMDGPUDAGToDAGISel::matchScaledGVSOffset(SDNode *MemNode,
+                                                  SDValue Off) const {
+  // gfx1250 handles this via SelectScaleOffset / the scale_offset CPol bit.
+  if (Subtarget->hasScaleOffset())
+    return SDValue();
+
+  SDValue X;
+  unsigned C = 0;
+
+  // Case 1: EXT(shl(i32 x, C))
+  if ((Off.getOpcode() == ISD::SIGN_EXTEND ||
+       Off.getOpcode() == ISD::ZERO_EXTEND ||
+       Off.getOpcode() == ISD::ANY_EXTEND) &&
+      Off.getOperand(0).getValueType() == MVT::i32) {
+    SDValue Inner = Off.getOperand(0);
+    if (Inner.getOpcode() == ISD::SHL) {
+      if (auto *ShAmt = dyn_cast<ConstantSDNode>(Inner.getOperand(1))) {
+        X = Inner.getOperand(0);
+        C = ShAmt->getZExtValue();
+      }
+    }
+  }
+  // Case 2: shl(EXT(i32 x), C)
+  else if (Off.getOpcode() == ISD::SHL) {
+    if (auto *ShAmt = dyn_cast<ConstantSDNode>(Off.getOperand(1))) {
+      SDValue Inner = Off.getOperand(0);
+      if ((Inner.getOpcode() == ISD::SIGN_EXTEND ||
+           Inner.getOpcode() == ISD::ZERO_EXTEND ||
+           Inner.getOpcode() == ISD::ANY_EXTEND) &&
+          Inner.getOperand(0).getValueType() == MVT::i32) {
+        X = Inner.getOperand(0);
+        C = ShAmt->getZExtValue();
+      }
+    }
+  }
+
+  if (!X)
+    return SDValue();
+
+  // C must equal log2(access size in bytes).
+  unsigned Size =
+      (unsigned)cast<MemSDNode>(MemNode)->getMemoryVT().getFixedSizeInBits() / 8;
+  if (!isPowerOf2_32(Size) || C != Log2_32(Size))
+    return SDValue();
+
+  // Soundness: the 32-bit byte offset must not have its sign bit set so that
+  // zext32->64 and sext32->64 agree. Either prove it statically or rely on
+  // the opt-in attribute.
+  KnownBits KB = CurDAG->computeKnownBits(X);
+  bool SignBitSafe = KB.countMinLeadingZeros() > C; // x<<C sign bit == 0
+  if (!SignBitSafe && !assume32BitGlobalOffset())
+    return SDValue();
+
+  // Materialise  V_LSHLREV_B32  C, X  →  X << C  as an i32 byte offset.
+  SDLoc DL(Off);
+  SDNode *Shl = CurDAG->getMachineNode(
+      AMDGPU::V_LSHLREV_B32_e64, DL, MVT::i32,
+      CurDAG->getTargetConstant(C, DL, MVT::i32), X);
+  return SDValue(Shl, 0);
+}
+
+
 // Match (64-bit SGPR base) + (zext vgpr offset) + sext(imm offset)
 // or (64-bit SGPR base) + (sext vgpr offset) + sext(imm offset)
 bool AMDGPUDAGToDAGISel::SelectGlobalSAddr(SDNode *N, SDValue Addr,
@@ -2082,6 +2174,11 @@ bool AMDGPUDAGToDAGISel::SelectGlobalSAddr(SDNode *N, SDValue Addr,
               RHS, Subtarget->hasSignedGVSOffset(), CurDAG)) {
         SAddr = LHS;
         VOffset = ExtRHS;
+      } else if (SDValue ScaledRHS = matchScaledGVSOffset(N, RHS)) {
+        // sext(shl(i32 x, log2(size))) — SADDR with 32-bit byte voffset.
+        SAddr = LHS;
+        VOffset = ScaledRHS;
+        ScaleOffset = false; // byte offset already scaled; no CPol::SCAL needed.
       }
     }
 
@@ -2093,6 +2190,10 @@ bool AMDGPUDAGToDAGISel::SelectGlobalSAddr(SDNode *N, SDValue Addr,
               LHS, Subtarget->hasSignedGVSOffset(), CurDAG)) {
         SAddr = RHS;
         VOffset = ExtLHS;
+      } else if (SDValue ScaledLHS = matchScaledGVSOffset(N, LHS)) {
+        SAddr = RHS;
+        VOffset = ScaledLHS;
+        ScaleOffset = false;
       }
     }
 
