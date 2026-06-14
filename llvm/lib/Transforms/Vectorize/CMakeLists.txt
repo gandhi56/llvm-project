@@ -14,6 +14,7 @@ add_llvm_component_library(LLVMVectorize
   SandboxVectorizer/Passes/RegionsFromBBs.cpp
   SandboxVectorizer/Passes/RegionsFromMetadata.cpp
   SandboxVectorizer/Passes/SeedCollection.cpp
+  SandboxVectorizer/Passes/TopDownVec.cpp
   SandboxVectorizer/Passes/TransactionAcceptOrRevert.cpp
   SandboxVectorizer/Passes/TransactionSave.cpp
   SandboxVectorizer/RegionWithScore.cpp

@@ -13,6 +13,7 @@
 #include "llvm/Transforms/Vectorize/SandboxVectorizer/Passes/TransactionAlwaysAccept.h"
 #include "llvm/Transforms/Vectorize/SandboxVectorizer/Passes/TransactionAlwaysRevert.h"
 #include "llvm/Transforms/Vectorize/SandboxVectorizer/Passes/TransactionSave.h"
+#include "llvm/Transforms/Vectorize/SandboxVectorizer/Passes/TopDownVec.h"
 
 namespace llvm::sandboxir {
 

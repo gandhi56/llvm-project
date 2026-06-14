@@ -42,25 +42,6 @@ class LLVM_ABI BottomUpVec final : public RegionPass {
   /// invocations. Used for debugging miscompiles.
   unsigned long BottomUpInvocationCnt = 0;
 
-  /// Creates and returns a vector instruction that replaces the instructions in
-  /// \p Bndl. \p Operands are the already vectorized operands.
-  Value *createVectorInstr(ArrayRef<Value *> Bndl, ArrayRef<Value *> Operands);
-  /// Erases all dead instructions from the dead instruction candidates
-  /// collected during vectorization.
-  void tryEraseDeadInstrs();
-  /// Creates a shuffle instruction that shuffles \p VecOp according to \p Mask.
-  /// \p UserBB is the block of the user bundle.
-  Value *createShuffle(Value *VecOp, const ShuffleMask &Mask,
-                       BasicBlock *UserBB);
-  /// Packs all elements of \p ToPack into a vector and returns that vector. \p
-  /// UserBB is the block of the user bundle.
-  Value *createPack(ArrayRef<Value *> ToPack, BasicBlock *UserBB);
-  /// After we create vectors for groups of instructions, the original
-  /// instructions are potentially dead and may need to be removed. This
-  /// function helps collect these instructions (along with the pointer operands
-  /// for loads/stores) so that they can be cleaned up later.
-  void collectPotentiallyDeadInstrs(ArrayRef<Value *> Bndl);
-
   /// Helper class describing how(if) to vectorize the code.
   class ActionsVector {
   private:
@@ -88,9 +69,6 @@ class LLVM_ABI BottomUpVec final : public RegionPass {
   /// `Actions` vector.
   Action *vectorizeRec(ArrayRef<Value *> Bndl, ArrayRef<Value *> UserBndl,
                        unsigned Depth, LegalityAnalysis &Legality);
-  /// If the values in \p Bndl have external users, then emit unpacks and
-  /// connect them to the users. \p Vec is the vectorized form of \p Bndl.
-  void emitUnpacksForExternalUses(const ArrayRef<Value *> Bndl, Value *Vec);
   /// Generate vector instructions based on `Actions` and return the last vector
   /// created.
   Value *emitVectors();

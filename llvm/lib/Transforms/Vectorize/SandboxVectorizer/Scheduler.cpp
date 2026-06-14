@@ -78,9 +78,11 @@ void Scheduler::scheduleAndUpdateReadyList(SchedBundle &Bndl) {
   // dependency predecessors.
   for (DGNode *N : Bndl) {
     for (auto *DepN : N->preds(DAG)) {
-      DepN->decrUnscheduledSuccs();
-      if (DepN->ready() && !DepN->scheduled())
-        ReadyList.insert(DepN);
+      if (!DepN->scheduled()) {
+        DepN->decrUnscheduledSuccs();
+        if (DepN->ready())
+          ReadyList.insert(DepN);
+      }
     }
     N->setScheduled();
   }

@@ -349,7 +349,8 @@ void DependencyGraph::setDefUseUnscheduledSuccs(
         continue;
       if (!TopInterval.contains(OpI))
         continue;
-      OpN->incrUnscheduledSuccs();
+      if (!OpN->scheduled())
+        OpN->incrUnscheduledSuccs();
     }
   }
 }

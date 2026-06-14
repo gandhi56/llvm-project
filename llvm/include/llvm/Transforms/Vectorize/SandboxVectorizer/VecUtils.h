@@ -12,6 +12,8 @@
 #ifndef LLVM_TRANSFORMS_VECTORIZE_SANDBOXVECTORIZER_VECUTILS_H
 #define LLVM_TRANSFORMS_VECTORIZE_SANDBOXVECTORIZER_VECUTILS_H
 
+#include "llvm/ADT/ArrayRef.h"
+#include "llvm/ADT/DenseSet.h"
 #include "llvm/Analysis/ScalarEvolution.h"
 #include "llvm/IR/DataLayout.h"
 #include "llvm/SandboxIR/Type.h"
@@ -32,6 +34,9 @@ template <> struct DenseMapInfo<SmallVector<sandboxir::Value *>> {
 };
 
 namespace sandboxir {
+
+class ShuffleMask;
+class InstrMaps;
 
 class VecUtils {
 public:
@@ -379,10 +384,50 @@ public:
   }
 
 #ifndef NDEBUG
-  /// Helper dump function for debugging.
+  /// Print \p Bndl.ump function for debugging.
   LLVM_DUMP_METHOD static void dump(ArrayRef<Value *> Bndl);
   LLVM_DUMP_METHOD static void dump(ArrayRef<Instruction *> Bndl);
 #endif // NDEBUG
+
+private:
+  friend class TopDownVec;
+  friend class BottomUpVec;
+
+  /// \Returns the operand at \p OpIdx for each instruction in \p Bndl.
+  static SmallVector<Value *, 4> getOperand(ArrayRef<Value *> Bndl,
+                                            unsigned OpIdx) {
+    SmallVector<Value *, 4> Operands;
+    for (Value *BndlV : Bndl) {
+      auto *BndlI = cast<Instruction>(BndlV);
+      Operands.push_back(BndlI->getOperand(OpIdx));
+    }
+    return Operands;
+  }
+
+  /// \Returns the BB iterator after the lowest instruction in \p Vals, or the top
+  /// of BB if no instruction found in \p Vals.
+  static BasicBlock::iterator getInsertPointAfterInstrs(ArrayRef<Value *> Vals,
+                                                        BasicBlock *BB) {
+    auto *BotI = VecUtils::getLastPHIOrSelf(VecUtils::getLowest(Vals, BB));
+    if (BotI == nullptr)
+      // We are using BB->begin() (or after PHIs) as the fallback insert point.
+      return BB->empty()
+                 ? BB->begin()
+                 : std::next(
+                       VecUtils::getLastPHIOrSelf(&*BB->begin())->getIterator());
+    return std::next(BotI->getIterator());
+  }
+
+  /// Creates and returns a new vector instruction for \p Bndl with \p Operands.
+  static Value *createVectorInstr(ArrayRef<Value *> Bndl,
+                                  ArrayRef<Value *> Operands);
+
+  static void tryEraseDeadInstrs(DenseSet<Instruction *> &DeadInstrCandidates, StringRef PassName);
+  static Value *createShuffle(Value *VecOp, const ShuffleMask &Mask, BasicBlock *UserBB);
+  static Value *createPack(ArrayRef<Value *> ToPack, BasicBlock *UserBB);
+  static void collectPotentiallyDeadInstrs(ArrayRef<Value *> Bndl, DenseSet<Instruction *> &DeadInstrCandidates);
+  static void emitUnpacksForExternalUses(ArrayRef<Value *> Bndl, Value *Vec,
+                                         const InstrMaps &IMaps);
 };
 
 } // namespace sandboxir
